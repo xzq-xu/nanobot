@@ -1,6 +1,7 @@
 """Base LLM provider interface."""
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -103,7 +104,25 @@ class LLMProvider(ABC):
             LLMResponse with content and/or tool calls.
         """
         pass
-    
+
+    @abstractmethod
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator["LLMResponse"]:
+        """
+        Stream a chat completion request.
+
+        Yields:
+            Partial LLMResponse chunks with content or tool calls.
+        """
+        pass
+        yield  # type: ignore
+
     @abstractmethod
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
