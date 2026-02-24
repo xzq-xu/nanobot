@@ -225,7 +225,8 @@ class AgentLoop:
                 )
 
             if response.has_tool_calls:
-                if on_progress:
+                # Only send progress if not streaming (streaming delivers content via callback)
+                if on_progress and not stream_callback:
                     clean = self._strip_think(response.content)
                     if clean:
                         await on_progress(clean)
