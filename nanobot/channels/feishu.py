@@ -858,14 +858,13 @@ class FeishuChannel(BaseChannel):
                     streaming_session = None
 
             if use_streaming and streaming_session:
-                accumulated_text = ""
-                accumulated_lock = threading.Lock()
+                # Store accumulated text in session for access during close
+                streaming_session.accumulated_text = ""
 
                 def stream_callback(chunk: str) -> None:
-                    nonlocal accumulated_text
-                    with accumulated_lock:
-                        accumulated_text += chunk
-                        text_snapshot = accumulated_text
+                    with streaming_session._lock:
+                        streaming_session.accumulated_text += chunk
+                        text_snapshot = streaming_session.accumulated_text
                     try:
                         loop.run_in_executor(None, streaming_session.update_sync, text_snapshot)
                     except RuntimeError:
@@ -897,4 +896,6 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         await self.bus.wait_stream_done(stream_id, timeout=300)
         if not session.closed:
-            await loop.run_in_executor(None, session.close_sync, session.pending_text or session.current_text)
+            # Use accumulated_text which has the complete streamed content
+            final_text = getattr(session, "accumulated_text", None) or session.current_text
+            await loop.run_in_executor(None, session.close_sync, final_text)
