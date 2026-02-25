@@ -256,6 +256,11 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+
+                mt = self.tools.get("message")
+                if stream_callback and isinstance(mt, MessageTool) and mt._sent_in_turn:
+                    final_content = self._strip_think(response.content)
+                    break
             else:
                 final_content = self._strip_think(response.content)
                 break

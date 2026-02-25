@@ -387,6 +387,7 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._active_streams: dict[str, FeishuStreamingSession] = {}  # chat_id → active session
     
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -736,6 +737,14 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return False
 
+    @staticmethod
+    def _stream_append(session: FeishuStreamingSession, text: str) -> None:
+        """Append text to a streaming card and push an update."""
+        with session._lock:
+            session.accumulated_text += text
+            snapshot = session.accumulated_text
+        session.update_sync(snapshot)
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._client:
@@ -745,6 +754,7 @@ class FeishuChannel(BaseChannel):
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+            session = self._active_streams.get(msg.chat_id)
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -753,7 +763,11 @@ class FeishuChannel(BaseChannel):
                 ext = os.path.splitext(file_path)[1].lower()
                 if ext in self._IMAGE_EXTS:
                     key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
-                    if key:
+                    if not key:
+                        continue
+                    if session:
+                        self._stream_append(session, f"\n![image]({key})\n")
+                    else:
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
@@ -768,11 +782,14 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
-                card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
-                await loop.run_in_executor(
-                    None, self._send_message_sync,
-                    receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
-                )
+                if session:
+                    self._stream_append(session, f"\n\n{msg.content}")
+                else:
+                    card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
+                    await loop.run_in_executor(
+                        None, self._send_message_sync,
+                        receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+                    )
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
@@ -884,8 +901,8 @@ class FeishuChannel(BaseChannel):
                     streaming_session = None
 
             if use_streaming and streaming_session:
-                # Store accumulated text in session for access during close
                 streaming_session.accumulated_text = ""
+                self._active_streams[reply_to] = streaming_session
 
                 def stream_callback(chunk: str) -> None:
                     with streaming_session._lock:
@@ -913,6 +930,7 @@ class FeishuChannel(BaseChannel):
             # Wait for response and close streaming session
             if use_streaming and streaming_session:
                 await self._wait_and_close_stream(streaming_session, stream_id)
+                self._active_streams.pop(reply_to, None)
 
         except Exception as e:
             logger.error("Error processing Feishu message: {}", e)
@@ -921,7 +939,7 @@ class FeishuChannel(BaseChannel):
         """Wait for agent loop to finish, then close streaming session."""
         loop = asyncio.get_running_loop()
         await self.bus.wait_stream_done(stream_id, timeout=300)
+        await asyncio.sleep(2)  # drain pending outbound (e.g. media from tool calls)
         if not session.closed:
-            # Use accumulated_text which has the complete streamed content
             final_text = getattr(session, "accumulated_text", None) or session.current_text
             await loop.run_in_executor(None, session.close_sync, final_text)
