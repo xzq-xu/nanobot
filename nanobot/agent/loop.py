@@ -190,7 +190,6 @@ class AgentLoop:
             iteration += 1
 
             if stream_callback:
-                # Use streaming provider
                 full_content = ""
                 full_reasoning = ""
                 tool_calls: list = []
@@ -228,7 +227,6 @@ class AgentLoop:
                 )
 
             if response.has_tool_calls:
-                # Only send progress if not streaming (streaming delivers content via callback)
                 if on_progress and not stream_callback:
                     clean = self._strip_think(response.content)
                     if clean:
@@ -266,7 +264,7 @@ class AgentLoop:
                     break
             else:
                 clean = self._strip_think(response.content)
-                if on_progress and clean:
+                if on_progress and not stream_callback and clean:
                     await on_progress(clean)
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
