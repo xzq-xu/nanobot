@@ -1,4 +1,10 @@
-"""Agent loop: the core processing engine."""
+"""Agent loop: the core processing engine.
+
+Supports an optional dual-layer architecture (Steering Loop + AgentMessage)
+for dynamic task interruption and structured context hooks.
+Both layers are opt-in via ``enable_steering``; when disabled the behaviour
+is identical to the original single-layer loop.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +21,9 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.messages import AgentMessage
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.steering import InterruptionChecker
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -39,6 +47,9 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
     from nanobot.cron.service import CronService
 
+TransformContextHook = Callable[[list[AgentMessage]], list[AgentMessage]]
+ConvertToLlmHook = Callable[[list[AgentMessage]], list[dict[str, Any]]]
+
 
 class _LoopHook(AgentHook):
     """Core hook for the main loop."""
@@ -53,6 +64,7 @@ class _LoopHook(AgentHook):
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        interruption_checker: InterruptionChecker | None = None,
     ) -> None:
         self._loop = agent_loop
         self._on_progress = on_progress
@@ -61,6 +73,7 @@ class _LoopHook(AgentHook):
         self._channel = channel
         self._chat_id = chat_id
         self._message_id = message_id
+        self._interruption_checker = interruption_checker
         self._stream_buf = ""
 
     def wants_streaming(self) -> bool:
@@ -104,6 +117,23 @@ class _LoopHook(AgentHook):
             u.get("completion_tokens", 0),
             u.get("cached_tokens", 0),
         )
+        # Steering: inject interruptions after tool results
+        if self._interruption_checker and context.tool_calls:
+            pending = self._interruption_checker.drain_all()
+            if pending:
+                combined = "\n\n---\n\n".join(m.content for m in pending)
+                injection = (
+                    "[The user just sent a new message while you were working. "
+                    "Read it and decide: continue current work, switch to the "
+                    "new request, or address both.]\n\n" + combined
+                )
+                context.messages.append({"role": "user", "content": injection})
+                logger.info("Steering: injected {} interruption(s)", len(pending))
+                if self._on_progress:
+                    await self._on_progress(
+                        "New message merged into current conversation",
+                        tool_hint=True,
+                    )
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return self._loop._strip_think(content)
@@ -180,6 +210,10 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
+        *,
+        enable_steering: bool = False,
+        transform_context: TransformContextHook | None = None,
+        convert_to_llm: ConvertToLlmHook | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -212,6 +246,11 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
+        # Dual-layer architecture (opt-in)
+        self.enable_steering = enable_steering
+        self._transform_context = transform_context
+        self._convert_to_llm = convert_to_llm or AgentMessage.to_llm_list
+
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -240,6 +279,7 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        self._interrupt_checkers: dict[str, InterruptionChecker] = {}
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -341,6 +381,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        interruption_checker: InterruptionChecker | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -348,6 +389,9 @@ class AgentLoop:
         *on_stream_end(resuming)*: called when a streaming session finishes.
         ``resuming=True`` means tool calls follow (spinner should restart);
         ``resuming=False`` means this is the final response.
+
+        *interruption_checker*: when steering is enabled, used to merge user
+        messages that arrive during tool execution.
         """
         loop_hook = _LoopHook(
             self,
@@ -357,6 +401,7 @@ class AgentLoop:
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
+            interruption_checker=interruption_checker,
         )
         hook: AgentHook = (
             _LoopHookChain(loop_hook, self._extra_hooks)
@@ -397,7 +442,7 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
-        logger.info("Agent loop started")
+        logger.info("Agent loop started (steering={})", self.enable_steering)
 
         while self._running:
             try:
@@ -421,24 +466,36 @@ class AgentLoop:
                 if result:
                     await self.bus.publish_outbound(result)
                 continue
+
+            if self.enable_steering:
+                active = [t for t in self._active_tasks.get(msg.session_key, []) if not t.done()]
+                if active and msg.session_key in self._interrupt_checkers:
+                    await self._interrupt_checkers[msg.session_key].signal(msg)
+                    logger.info("Steering: signaled interruption for {}", msg.session_key)
+                    continue
+
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
             task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
+        checker: InterruptionChecker | None = None
+        if self.enable_steering:
+            checker = InterruptionChecker()
+            self._interrupt_checkers[msg.session_key] = checker
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
-        async with lock, gate:
-            try:
-                on_stream = on_stream_end = None
-                if msg.metadata.get("_wants_stream"):
-                    # Split one answer into distinct stream segments.
-                    stream_base_id = f"{msg.session_key}:{time.time_ns()}"
-                    stream_segment = 0
+        try:
+            async with lock, gate:
+                try:
+                    on_stream = on_stream_end = None
+                    if msg.metadata.get("_wants_stream"):
+                        stream_base_id = f"{msg.session_key}:{time.time_ns()}"
+                        stream_segment = 0
 
-                    def _current_stream_id() -> str:
-                        return f"{stream_base_id}:{stream_segment}"
+                        def _current_stream_id() -> str:
+                            return f"{stream_base_id}:{stream_segment}"
 
                     async def on_stream(delta: str) -> None:
                         meta = dict(msg.metadata or {})
@@ -463,25 +520,30 @@ class AgentLoop:
                         ))
                         stream_segment += 1
 
-                response = await self._process_message(
-                    msg, on_stream=on_stream, on_stream_end=on_stream_end,
-                )
-                if response is not None:
-                    await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
+                    response = await self._process_message(
+                        msg,
+                        on_stream=on_stream, on_stream_end=on_stream_end,
+                        interruption_checker=checker,
+                    )
+                    if response is not None:
+                        await self.bus.publish_outbound(response)
+                    elif msg.channel == "cli":
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="", metadata=msg.metadata or {},
+                        ))
+                except asyncio.CancelledError:
+                    logger.info("Task cancelled for session {}", msg.session_key)
+                    raise
+                except Exception:
+                    logger.exception("Error processing message for session {}", msg.session_key)
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
+                        content="Sorry, I encountered an error.",
                     ))
-            except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
-                raise
-            except Exception:
-                logger.exception("Error processing message for session {}", msg.session_key)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
-                ))
+        finally:
+            if self.enable_steering:
+                self._interrupt_checkers.pop(msg.session_key, None)
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -513,6 +575,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        interruption_checker: InterruptionChecker | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -536,6 +599,7 @@ class AgentLoop:
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                interruption_checker=interruption_checker,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self._clear_runtime_checkpoint(session)
@@ -589,6 +653,7 @@ class AgentLoop:
             session=session,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            interruption_checker=interruption_checker,
         )
 
         if final_content is None or not final_content.strip():
@@ -768,6 +833,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        interruption_checker: InterruptionChecker | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -775,4 +841,5 @@ class AgentLoop:
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
             on_stream=on_stream, on_stream_end=on_stream_end,
+            interruption_checker=interruption_checker,
         )
