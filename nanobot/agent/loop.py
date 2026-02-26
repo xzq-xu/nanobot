@@ -264,8 +264,6 @@ class AgentLoop:
                     break
             else:
                 clean = self._strip_think(response.content)
-                if on_progress and not stream_callback and clean:
-                    await on_progress(clean)
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                 )
