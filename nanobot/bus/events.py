@@ -8,7 +8,7 @@ from typing import Any
 @dataclass
 class InboundMessage:
     """Message received from a chat channel."""
-    
+
     channel: str  # telegram, discord, slack, whatsapp
     sender_id: str  # User identifier
     chat_id: str  # Chat/channel identifier
@@ -28,7 +28,7 @@ class InboundMessage:
 @dataclass
 class OutboundMessage:
     """Message to send to a chat channel."""
-    
+
     channel: str
     chat_id: str
     content: str
