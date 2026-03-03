@@ -229,10 +229,29 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
 
+        def _drain_interruptions() -> str | None:
+            """Drain pending interruptions into a combined user message, or None."""
+            if not interruption_checker:
+                return None
+            pending = interruption_checker.drain_all()
+            if not pending:
+                return None
+            combined = "\n\n---\n\n".join(m.content for m in pending)
+            return (
+                "[The user just sent a new message while you were working. "
+                "Read it and decide: continue current work, switch to the "
+                "new request, or address both.]\n\n" + combined
+            )
+
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
+
+            # Steering: check for interruptions before LLM call
+            if injection := _drain_interruptions():
+                messages.append({"role": "user", "content": injection})
+                logger.info("Steering: injected interruption before LLM call")
 
             # Context hooks: transform before LLM call (opt-in)
             if self._transform_context:
@@ -267,7 +286,19 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
+                for i, tool_call in enumerate(response.tool_calls):
+                    # Steering: check before each tool — cancel remaining on interruption
+                    if injection := _drain_interruptions():
+                        logger.info("Steering: interruption during tools, cancelling {} remaining", len(response.tool_calls) - i)
+                        for tc in response.tool_calls[i:]:
+                            messages = self.context.add_tool_result(
+                                messages, tc.id, tc.name, "CANCELLED: User interrupted",
+                            )
+                        messages.append({"role": "user", "content": injection})
+                        if on_progress:
+                            await on_progress("New message merged, remaining tools cancelled", tool_hint=True)
+                        break
+
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
@@ -275,24 +306,6 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
-
-                # Steering: check for interruptions after all tool results
-                if interruption_checker:
-                    pending = interruption_checker.drain_all()
-                    if pending:
-                        combined = "\n\n---\n\n".join(m.content for m in pending)
-                        injection = (
-                            "[The user just sent a new message while you were working. "
-                            "Read it and decide: continue current work, switch to the "
-                            "new request, or address both.]\n\n" + combined
-                        )
-                        messages.append({"role": "user", "content": injection})
-                        logger.info("Steering: injected {} interruption(s)", len(pending))
-                        if on_progress:
-                            await on_progress(
-                                "New message merged into current conversation",
-                                tool_hint=True,
-                            )
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
