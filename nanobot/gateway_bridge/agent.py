@@ -31,7 +31,7 @@ class NanobotAgent:
         self.workspace_path = workspace_path
         self.bus = MessageBus()
         self.provider = self._make_provider()
-        self.session_manager = SessionManager()
+        self.session_manager = SessionManager(workspace_path)
         self._agent = None
 
     def _make_provider(self):
@@ -43,25 +43,23 @@ class NanobotAgent:
         model = config.agents.defaults.model
         provider_name = config.get_provider_name()
         p = config.get_provider()
+        api_base = config.get_api_base()
 
         if model.startswith("openai-codex/"):
             return OpenAICodexProvider(default_model=model)
 
         if provider_name == "custom":
             return CustomProvider(
-                api_key=p.api_key or "no-key",
-                api_base=p.get_api_base() or "http://localhost:8000/v1",
+                api_key=p.api_key if p else "no-key",
+                api_base=api_base or "http://localhost:8000/v1",
                 default_model=model,
             )
 
-        from nanobot.providers.registry import find_by_name
-        spec = find_by_name(provider_name)
-
         return LiteLLMProvider(
-            api_key=p.api_key,
-            api_base=p.get_api_base(),
+            api_key=p.api_key if p else None,
+            api_base=api_base,
             default_model=model,
-            extra_headers=p.extra_headers,
+            extra_headers=p.extra_headers if p else None,
             provider_name=provider_name,
         )
 
@@ -74,7 +72,7 @@ class NanobotAgent:
         cron_store_path = get_data_dir() / "cron" / "jobs.json"
 
         from nanobot.cron.service import CronService
-        cron = CronService(bus=self.bus, provider=self.provider, workspace=self.workspace_path)
+        cron = CronService(store_path=cron_store_path)
 
         return AgentLoop(
             bus=self.bus,
@@ -86,14 +84,15 @@ class NanobotAgent:
             max_iterations=config.agents.defaults.max_tool_iterations,
             memory_window=config.agents.defaults.memory_window,
             reasoning_effort=config.agents.defaults.reasoning_effort,
-            brave_api_key=config.web.search.api_key if config.web and config.web.search else None,
-            web_proxy=config.web.proxy if config.web else None,
+            brave_api_key=config.tools.web.search.api_key if config.tools.web.search else None,
+            web_proxy=config.tools.web.proxy,
             exec_config=exec_config,
             cron_service=cron,
-            restrict_to_workspace=config.agents.defaults.restrict_to_workspace,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
             session_manager=self.session_manager,
-            mcp_servers=config.mcp_servers,
+            mcp_servers=config.tools.mcp_servers or None,
             channels_config=config.channels,
+            enable_steering=True,
         )
 
     async def start(self):
