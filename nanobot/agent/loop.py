@@ -300,15 +300,6 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                # Before ending, check if new messages arrived during the LLM call.
-                # If so, inject them and continue — let the model address them.
-                if injection := _drain_interruptions():
-                    messages.append({"role": "user", "content": injection})
-                    if on_progress:
-                        await on_progress(clean)
-                    logger.info("Steering: pending interruption after final response, continuing loop")
-                    continue
-
                 final_content = clean
                 break
 
