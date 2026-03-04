@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from sse_starlette import EventSourceResponse
 
+from nanobot.agent.steering import InterruptionChecker
+from nanobot.bus.events import InboundMessage
 from nanobot.config.loader import load_config
 from nanobot import __version__
 
@@ -137,45 +139,48 @@ async def websocket_chat(websocket: WebSocket):
     - Client sends: {"type": "abort", "session_id": "..."}
     - Server sends events: {"type": "delta|tool|lifecycle|final", ...}
 
-    New messages are serialised per-session via asyncio.Lock so that nanobot
-    sees the full conversation history before processing each follow-up.
-    Only an explicit "abort" command cancels in-flight work; regular
-    messages never auto-cancel — the model decides how to handle them.
+    Steering / follow-up: when a new message arrives while processing is
+    in progress, the message is injected via InterruptionChecker.  The model
+    sees the new message at the next tool boundary or LLM call and decides
+    itself whether to continue, switch, or address both.  No task
+    cancellation, no waiting — the model decides.
     """
     await websocket.accept()
     logger.info("WebSocket client connected")
 
     agent = get_agent()
     send_q: asyncio.Queue[dict] = asyncio.Queue()
-    active_tasks: dict[str, list[asyncio.Task]] = {}
-    session_locks: dict[str, asyncio.Lock] = {}
+
+    # One active task per session; checker is alive while task runs.
+    active_tasks: dict[str, asyncio.Task] = {}
+    checkers: dict[str, InterruptionChecker] = {}
 
     # -- helpers ----------------------------------------------------------
 
     def _enqueue(event: dict) -> None:
-        """Non-blocking push; safe to call from cancelled coroutines."""
         try:
             send_q.put_nowait(event)
         except asyncio.QueueFull:
             pass
 
-    async def _cancel_session(session_id: str) -> None:
-        """Cancel ALL running/queued tasks for *session_id*."""
-        tasks = active_tasks.pop(session_id, [])
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        for task in tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+    async def _cancel_task(session_id: str) -> None:
+        """Explicit abort — cancel the in-flight task."""
+        task = active_tasks.pop(session_id, None)
+        checkers.pop(session_id, None)
+        if task is None or task.done():
+            return
+        logger.info("Cancelling task for session {}", session_id)
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # -- per-message processing -------------------------------------------
 
     async def _run_chat(message: str, session_id: str, run_id: str) -> None:
-        """Process one message, serialised per session via asyncio.Lock."""
-        lock = session_locks.setdefault(session_id, asyncio.Lock())
+        checker = InterruptionChecker()
+        checkers[session_id] = checker
 
         async def on_progress(content: str, tool_hint: bool = False):
             if tool_hint:
@@ -191,42 +196,45 @@ async def websocket_chat(websocket: WebSocket):
                     "run_id": run_id, "session_key": session_id,
                 })
 
-        async with lock:
+        _enqueue({
+            "type": "lifecycle", "phase": "start",
+            "run_id": run_id, "session_key": session_id,
+        })
+        try:
+            logger.info("Processing message: run_id={} session={}", run_id, session_id)
+            result = await agent._agent.process_direct(
+                content=message,
+                session_key=session_id,
+                channel="gateway",
+                chat_id="direct",
+                on_progress=on_progress,
+                interruption_checker=checker,
+            )
+            logger.info("Run complete: run_id={} result_len={}", run_id, len(result or ""))
             _enqueue({
-                "type": "lifecycle", "phase": "start",
+                "type": "final", "content": result or "",
                 "run_id": run_id, "session_key": session_id,
             })
-            try:
-                logger.info("Processing message: run_id={} session={}", run_id, session_id)
-                result = await agent._agent.process_direct(
-                    content=message,
-                    session_key=session_id,
-                    channel="gateway",
-                    chat_id="direct",
-                    on_progress=on_progress,
-                )
-                logger.info("Run complete: run_id={} result_len={}", run_id, len(result or ""))
-                _enqueue({
-                    "type": "final", "content": result or "",
-                    "run_id": run_id, "session_key": session_id,
-                })
-                _enqueue({
-                    "type": "lifecycle", "phase": "end",
-                    "run_id": run_id, "session_key": session_id,
-                })
-            except asyncio.CancelledError:
-                logger.warning("Run aborted: run_id={}", run_id)
-                _enqueue({
-                    "type": "lifecycle", "phase": "aborted",
-                    "run_id": run_id, "session_key": session_id,
-                })
-            except Exception as e:
-                logger.exception("Chat error (run_id={}): {}", run_id, e)
-                _enqueue({
-                    "type": "lifecycle", "phase": "error",
-                    "error": str(e),
-                    "run_id": run_id, "session_key": session_id,
-                })
+            _enqueue({
+                "type": "lifecycle", "phase": "end",
+                "run_id": run_id, "session_key": session_id,
+            })
+        except asyncio.CancelledError:
+            logger.warning("Run aborted: run_id={}", run_id)
+            _enqueue({
+                "type": "lifecycle", "phase": "aborted",
+                "run_id": run_id, "session_key": session_id,
+            })
+        except Exception as e:
+            logger.exception("Chat error (run_id={}): {}", run_id, e)
+            _enqueue({
+                "type": "lifecycle", "phase": "error",
+                "error": str(e),
+                "run_id": run_id, "session_key": session_id,
+            })
+        finally:
+            checkers.pop(session_id, None)
+            active_tasks.pop(session_id, None)
 
     # -- two concurrent loops ---------------------------------------------
 
@@ -239,7 +247,7 @@ async def websocket_chat(websocket: WebSocket):
 
                 if msg_type == "abort":
                     logger.info("Abort requested for session {}", session_id)
-                    await _cancel_session(session_id)
+                    await _cancel_task(session_id)
                     continue
 
                 message = data.get("message", "")
@@ -247,14 +255,25 @@ async def websocket_chat(websocket: WebSocket):
                     _enqueue({"type": "error", "error": "Empty message"})
                     continue
 
+                # Check for active task → steer via InterruptionChecker
+                existing = active_tasks.get(session_id)
+                if existing and not existing.done():
+                    checker = checkers.get(session_id)
+                    if checker:
+                        inbound = InboundMessage(
+                            channel="gateway",
+                            sender_id="user",
+                            chat_id="direct",
+                            content=message,
+                        )
+                        await checker.signal(inbound)
+                        logger.info("Steering: injected message into active session {}", session_id)
+                        continue
+
+                # No active task → start fresh
                 run_id = str(uuid.uuid4())
                 task = asyncio.create_task(_run_chat(message, session_id, run_id))
-                active_tasks.setdefault(session_id, []).append(task)
-                task.add_done_callback(
-                    lambda t, s=session_id: active_tasks.get(s, []) and (
-                        active_tasks[s].remove(t) if t in active_tasks.get(s, []) else None
-                    )
-                )
+                active_tasks[session_id] = task
         except WebSocketDisconnect:
             logger.info("recv_loop: client disconnected")
         except Exception as e:
@@ -267,7 +286,7 @@ async def websocket_chat(websocket: WebSocket):
                 try:
                     await websocket.send_json(event)
                 except Exception as e:
-                    logger.warning("send_loop: failed to send event ({}), skipping: {}", event.get("type"), e)
+                    logger.warning("send_loop: failed to send ({}): {}", event.get("type"), e)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -288,12 +307,9 @@ async def websocket_chat(websocket: WebSocket):
     except Exception as e:
         logger.error("WebSocket wait error: {}", e)
     finally:
-        total = sum(len(ts) for ts in active_tasks.values())
-        logger.info("WebSocket cleanup: cancelling {} active tasks", total)
-        for tasks in active_tasks.values():
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
+        for task in active_tasks.values():
+            if not task.done():
+                task.cancel()
         recv.cancel()
         send.cancel()
 
