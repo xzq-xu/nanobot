@@ -213,3 +213,11 @@ class NanobotAgent:
         tasks = self._agent._active_tasks.pop(session_id, [])
         cancelled = sum(t.cancel() for t in tasks)
         return cancelled > 0
+
+    async def list_sessions(self) -> list[dict]:
+        """List all sessions."""
+        return self.session_manager.list_sessions()
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a session by key."""
+        return self.session_manager.delete(session_id)

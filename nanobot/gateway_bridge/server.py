@@ -129,6 +129,30 @@ async def abort_chat(session_id: str):
         return {"success": False, "error": str(e)}
 
 
+@app.get("/sessions")
+async def list_sessions():
+    """List all sessions."""
+    agent = get_agent()
+    try:
+        sessions = await agent.list_sessions()
+        return {"sessions": sessions}
+    except Exception as e:
+        logger.error("List sessions error: {}", e)
+        return {"sessions": [], "error": str(e)}
+
+
+@app.delete("/chat/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session."""
+    agent = get_agent()
+    try:
+        success = await agent.delete_session(session_id)
+        return {"success": success}
+    except Exception as e:
+        logger.error("Delete session error: {}", e)
+        return {"success": False, "error": str(e)}
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     """
@@ -200,6 +224,7 @@ async def websocket_chat(websocket: WebSocket):
             "type": "lifecycle", "phase": "start",
             "run_id": run_id, "session_key": session_id,
         })
+        orphans: list = []
         try:
             logger.info("Processing message: run_id={} session={}", run_id, session_id)
             result = await agent._agent.process_direct(
@@ -211,14 +236,17 @@ async def websocket_chat(websocket: WebSocket):
                 interruption_checker=checker,
             )
             logger.info("Run complete: run_id={} result_len={}", run_id, len(result or ""))
+            orphans = checker.drain_all()
             _enqueue({
                 "type": "final", "content": result or "",
                 "run_id": run_id, "session_key": session_id,
+                **({"has_more": True} if orphans else {}),
             })
-            _enqueue({
-                "type": "lifecycle", "phase": "end",
-                "run_id": run_id, "session_key": session_id,
-            })
+            if not orphans:
+                _enqueue({
+                    "type": "lifecycle", "phase": "end",
+                    "run_id": run_id, "session_key": session_id,
+                })
         except asyncio.CancelledError:
             logger.warning("Run aborted: run_id={}", run_id)
             _enqueue({
@@ -235,6 +263,12 @@ async def websocket_chat(websocket: WebSocket):
         finally:
             checkers.pop(session_id, None)
             active_tasks.pop(session_id, None)
+
+            for orphan in orphans:
+                logger.info("Steering: re-queuing orphaned message as new task for {}", session_id)
+                new_run_id = str(uuid.uuid4())
+                task = asyncio.create_task(_run_chat(orphan.content, session_id, new_run_id))
+                active_tasks[session_id] = task
 
     # -- two concurrent loops ---------------------------------------------
 
