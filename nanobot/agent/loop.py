@@ -396,7 +396,12 @@ class AgentLoop:
                 ))
             finally:
                 if self.enable_steering:
-                    self._interrupt_checkers.pop(msg.session_key, None)
+                    checker = self._interrupt_checkers.pop(msg.session_key, None)
+                    # Re-publish orphaned messages so they're processed as new tasks
+                    if checker:
+                        for orphan in checker.drain_all():
+                            logger.info("Steering: re-queuing orphaned message for {}", msg.session_key)
+                            await self.bus.publish_inbound(orphan)
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
