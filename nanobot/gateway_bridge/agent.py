@@ -183,13 +183,25 @@ class NanobotAgent:
                 "session_key": session_id,
             }
 
+    _STEERING_PREFIX = (
+        "[The user just sent a new message while you were working. "
+        "Read it and decide: continue current work, switch to the "
+        "new request, or address both.]\n\n"
+    )
+
     async def get_history(self, session_id: str) -> list[dict]:
-        """Get chat history for a session."""
+        """Get chat history for a session, stripping internal steering metadata."""
         if self._agent is None:
             await self.start()
         session = self._agent.sessions.get_or_create(session_id)
         messages = session.get_history()
-        return [{"role": msg.role, "content": msg.content} for msg in messages]
+        out = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if msg["role"] == "user" and isinstance(content, str) and content.startswith(self._STEERING_PREFIX):
+                content = content[len(self._STEERING_PREFIX):]
+            out.append({"role": msg["role"], "content": content})
+        return out
 
     async def abort(self, session_id: str) -> bool:
         """Abort a running task.
