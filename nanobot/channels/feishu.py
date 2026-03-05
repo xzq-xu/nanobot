@@ -18,36 +18,10 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import FeishuConfig
 
-try:
-    import lark_oapi as lark
-    from lark_oapi.api.cardkit.v1 import (
-        ContentCardElementRequest,
-        ContentCardElementRequestBody,
-        CreateCardRequest,
-        CreateCardRequestBody,
-        SettingsCardRequest,
-        SettingsCardRequestBody,
-    )
-    from lark_oapi.api.im.v1 import (
-        CreateFileRequest,
-        CreateFileRequestBody,
-        CreateImageRequest,
-        CreateImageRequestBody,
-        CreateMessageReactionRequest,
-        CreateMessageReactionRequestBody,
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-        Emoji,
-        GetMessageResourceRequest,
-        P2ImMessageReceiveV1,
-    )
-    FEISHU_AVAILABLE = True
-    CARDKIT_AVAILABLE = True
-except ImportError:
-    FEISHU_AVAILABLE = False
-    CARDKIT_AVAILABLE = False
-    lark = None
-    Emoji = None
+import importlib.util
+
+FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
+CARDKIT_AVAILABLE = FEISHU_AVAILABLE and importlib.util.find_spec("lark_oapi.api.cardkit") is not None
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -98,6 +72,10 @@ class FeishuStreamingSession:
         """Create card entity and send it."""
         if self.card_id or not CARDKIT_AVAILABLE:
             return bool(self.card_id)
+        from lark_oapi.api.cardkit.v1 import (
+            CreateCardRequest, CreateCardRequestBody,
+        )
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         try:
             create_req = CreateCardRequest.builder().request_body(
                 CreateCardRequestBody.builder().type("card_json").data(self._build_streaming_card_json()).build()
@@ -122,6 +100,7 @@ class FeishuStreamingSession:
         """Update card content with throttling."""
         if self.closed or not self.card_id:
             return False
+        from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
         with self._lock:
             now = time.time() * 1000
             if now - self.last_update_time < 100:
@@ -147,6 +126,10 @@ class FeishuStreamingSession:
         self.closed = True
         if not self.card_id:
             return False
+        from lark_oapi.api.cardkit.v1 import (
+            ContentCardElementRequest, ContentCardElementRequestBody,
+            SettingsCardRequest, SettingsCardRequestBody,
+        )
         text = final_text or self.pending_text or self.current_text or "Done."
         try:
             with self._lock:
@@ -401,6 +384,7 @@ class FeishuChannel(BaseChannel):
             logger.error("Feishu app_id and app_secret not configured")
             return
 
+        import lark_oapi as lark
         self._running = True
         self._loop = asyncio.get_running_loop()
 
@@ -461,6 +445,7 @@ class FeishuChannel(BaseChannel):
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
+        from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
         try:
             request = CreateMessageReactionRequest.builder() \
                 .message_id(message_id) \
@@ -485,7 +470,7 @@ class FeishuChannel(BaseChannel):
 
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
         """
-        if not self._client or not Emoji:
+        if not self._client:
             return
 
         loop = asyncio.get_running_loop()
@@ -577,6 +562,7 @@ class FeishuChannel(BaseChannel):
 
     def _upload_image_sync(self, file_path: str) -> str | None:
         """Upload an image to Feishu and return the image_key."""
+        from lark_oapi.api.im.v1 import CreateImageRequest, CreateImageRequestBody
         try:
             with open(file_path, "rb") as f:
                 request = CreateImageRequest.builder() \
@@ -600,6 +586,7 @@ class FeishuChannel(BaseChannel):
 
     def _upload_file_sync(self, file_path: str) -> str | None:
         """Upload a file to Feishu and return the file_key."""
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
         ext = os.path.splitext(file_path)[1].lower()
         file_type = self._FILE_TYPE_MAP.get(ext, "stream")
         file_name = os.path.basename(file_path)
@@ -627,6 +614,7 @@ class FeishuChannel(BaseChannel):
 
     def _download_image_sync(self, message_id: str, image_key: str) -> tuple[bytes | None, str | None]:
         """Download an image from Feishu message by message_id and image_key."""
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
         try:
             request = GetMessageResourceRequest.builder() \
                 .message_id(message_id) \
@@ -651,6 +639,13 @@ class FeishuChannel(BaseChannel):
         self, message_id: str, file_key: str, resource_type: str = "file"
     ) -> tuple[bytes | None, str | None]:
         """Download a file/audio/media from a Feishu message by message_id and file_key."""
+        from lark_oapi.api.im.v1 import GetMessageResourceRequest
+
+        # Feishu API only accepts 'image' or 'file' as type parameter
+        # Convert 'audio' to 'file' for API compatibility
+        if resource_type == "audio":
+            resource_type = "file"
+
         try:
             request = (
                 GetMessageResourceRequest.builder()
@@ -719,6 +714,7 @@ class FeishuChannel(BaseChannel):
 
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
         """Send a single message (text/image/file/interactive) synchronously."""
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         try:
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \
