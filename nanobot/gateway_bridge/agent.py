@@ -204,9 +204,14 @@ class NanobotAgent:
             if msg["role"] == "user" and isinstance(content, str) and content.startswith(self._STEERING_PREFIX):
                 content = content[len(self._STEERING_PREFIX):]
 
-            # Extract media from message tool calls and append as markdown
+            # Extract content + media from message tool calls
             if msg["role"] == "assistant" and msg.get("tool_calls"):
-                media_md = self._extract_message_tool_media(msg["tool_calls"])
+                msg_text, media_md = self._extract_message_tool_content(msg["tool_calls"])
+                if msg_text:
+                    if not content or content.strip() in ("", "..."):
+                        content = msg_text
+                    else:
+                        content = content + "\n" + msg_text
                 if media_md:
                     content = (content or "") + media_md
 
@@ -214,10 +219,12 @@ class NanobotAgent:
         return out
 
     @staticmethod
-    def _extract_message_tool_media(tool_calls: list) -> str:
-        """Extract media file paths from message tool calls, return as markdown."""
+    def _extract_message_tool_content(tool_calls: list) -> tuple[str, str]:
+        """Extract text content and media from message tool calls.
+        Returns (text_content, media_markdown)."""
         import json as _json
-        parts = []
+        texts = []
+        media_parts = []
         for tc in tool_calls:
             fn = tc.get("function", {})
             if fn.get("name") != "message":
@@ -226,9 +233,12 @@ class NanobotAgent:
                 args = _json.loads(fn.get("arguments", "{}"))
             except (ValueError, TypeError):
                 continue
+            text = args.get("content", "")
+            if text:
+                texts.append(text)
             for path in args.get("media", []):
-                parts.append(f"\n![image]({path})")
-        return "".join(parts)
+                media_parts.append(f"\n![image]({path})")
+        return "\n".join(texts), "".join(media_parts)
 
     async def abort(self, session_id: str) -> bool:
         """Abort a running task.
