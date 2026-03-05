@@ -43,6 +43,8 @@ dependencies = [
     "mcp>=1.26.0,<2.0.0",
     "json-repair>=0.57.0,<1.0.0",
     "openai>=2.8.0",
+    "fastapi>=0.115.0",
+    "sse-starlette>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -59,6 +61,7 @@ dev = [
 
 [project.scripts]
 nanobot = "nanobot.cli.commands:app"
+nanobot-gateway = "nanobot.gateway_bridge.server:main"
 
 [build-system]
 requires = ["hatchling"]

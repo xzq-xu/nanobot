@@ -1,0 +1,103 @@
+name: Build nanobot-gateway
+
+on:
+  push:
+    tags:
+      - "gateway-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+          - os: macos-13
+            platform: darwin
+            arch: x64
+          - os: windows-latest
+            platform: win
+            arch: x64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install pyinstaller
+
+      - name: Build binary
+        run: python scripts/build-gateway.py --clean
+
+      - name: Verify binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          BINARY=dist/nanobot-gateway-${{ matrix.platform }}-${{ matrix.arch }}
+          chmod +x "$BINARY"
+          "$BINARY" --port 19999 &
+          PID=$!
+          sleep 15
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:19999/health)
+          kill $PID 2>/dev/null || true
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "Health check passed"
+
+      - name: Verify binary (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "dist\nanobot-gateway-win-x64.exe"
+          $proc = Start-Process -FilePath $binary -ArgumentList "--port","19999" -PassThru -NoNewWindow
+          Start-Sleep -Seconds 20
+          try {
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:19999/health" -UseBasicParsing -TimeoutSec 5
+            if ($resp.StatusCode -ne 200) { throw "Health check failed: $($resp.StatusCode)" }
+            Write-Host "Health check passed"
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanobot-gateway-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/nanobot-gateway-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/gateway-v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
