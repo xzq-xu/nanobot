@@ -1,13 +1,17 @@
 """FastAPI server for nanobot gateway bridge."""
 
 import asyncio
+import mimetypes
+import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from loguru import logger
 from sse_starlette import EventSourceResponse
 
@@ -61,11 +65,56 @@ app.add_middleware(
 )
 
 
+_gateway_port: int = 18790
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+_LOCAL_IMG_RE = re.compile(
+    r'(!\[[^\]]*\])\((/[^)]+?\.(?:png|jpe?g|gif|webp|bmp|svg))\)',
+    re.IGNORECASE,
+)
+
+
+def _rewrite_local_images(text: str) -> str:
+    """Rewrite markdown images with local paths to gateway /files/ URLs."""
+    if not text:
+        return text
+
+    def _replace(m):
+        alt, fpath = m.group(1), m.group(2)
+        if Path(fpath).is_file():
+            return f"{alt}(http://127.0.0.1:{_gateway_port}/files{quote(fpath)})"
+        return m.group(0)
+
+    return _LOCAL_IMG_RE.sub(_replace, text)
+
+
+def _file_paths_to_urls(paths: list[str]) -> list[str]:
+    """Convert local file paths to gateway /files/ URLs."""
+    urls = []
+    for p in paths:
+        fp = Path(p)
+        if fp.is_file() and fp.suffix.lower() in _IMAGE_EXTS:
+            urls.append(f"http://127.0.0.1:{_gateway_port}/files{quote(str(fp))}")
+        elif p.startswith("http"):
+            urls.append(p)
+    return urls
+
+
 def get_agent() -> NanobotAgent:
     """Get the global agent instance."""
     if _agent is None:
         raise RuntimeError("Agent not initialized")
     return _agent
+
+
+@app.get("/files/{file_path:path}")
+async def serve_file(file_path: str):
+    """Serve local files (images) so the frontend can display them."""
+    fp = Path("/") / file_path
+    if not fp.is_file():
+        return Response(status_code=404, content="Not found")
+    mime, _ = mimetypes.guess_type(str(fp))
+    return FileResponse(fp, media_type=mime or "application/octet-stream")
 
 
 @app.get("/health")
@@ -110,6 +159,9 @@ async def get_history(session_id: str):
 
     try:
         history = await agent.get_history(session_id)
+        for msg in history:
+            if isinstance(msg.get("content"), str):
+                msg["content"] = _rewrite_local_images(msg["content"])
         return {"session_id": session_id, "messages": history}
     except Exception as e:
         logger.error("History error: {}", e)
@@ -178,6 +230,9 @@ async def websocket_chat(websocket: WebSocket):
     # One active task per session; checker is alive while task runs.
     active_tasks: dict[str, asyncio.Task] = {}
     checkers: dict[str, InterruptionChecker] = {}
+    # Map (channel, chat_id) → session_key so bus_outbound_loop can tag
+    # outbound messages with the correct session_key.
+    chat_to_session: dict[tuple[str, str], str] = {}
 
     # -- helpers ----------------------------------------------------------
 
@@ -205,6 +260,7 @@ async def websocket_chat(websocket: WebSocket):
     async def _run_chat(message: str, session_id: str, run_id: str) -> None:
         checker = InterruptionChecker()
         checkers[session_id] = checker
+        chat_to_session[("gateway", "direct")] = session_id
 
         async def on_progress(content: str, tool_hint: bool = False):
             if tool_hint:
@@ -216,7 +272,7 @@ async def websocket_chat(websocket: WebSocket):
                 })
             else:
                 _enqueue({
-                    "type": "delta", "delta": content,
+                    "type": "delta", "delta": _rewrite_local_images(content),
                     "run_id": run_id, "session_key": session_id,
                 })
 
@@ -238,7 +294,7 @@ async def websocket_chat(websocket: WebSocket):
             logger.info("Run complete: run_id={} result_len={}", run_id, len(result or ""))
             orphans = checker.drain_all()
             _enqueue({
-                "type": "final", "content": result or "",
+                "type": "final", "content": _rewrite_local_images(result or ""),
                 "run_id": run_id, "session_key": session_id,
                 **({"has_more": True} if orphans else {}),
             })
@@ -326,12 +382,37 @@ async def websocket_chat(websocket: WebSocket):
         except Exception as e:
             logger.exception("send_loop crashed: {}", e)
 
+    async def bus_outbound_loop():
+        """Forward OutboundMessage from the message tool (media) to WebSocket."""
+        try:
+            while True:
+                msg = await agent.bus.consume_outbound()
+                media = msg.media or []
+                content = _rewrite_local_images(msg.content or "")
+                image_urls = _file_paths_to_urls(media) if media else []
+                session_key = chat_to_session.get(
+                    (msg.channel, msg.chat_id),
+                    next(iter(active_tasks), msg.chat_id or "cli:direct"),
+                )
+                if content or image_urls:
+                    _enqueue({
+                        "type": "message",
+                        "content": content,
+                        "images": image_urls,
+                        "session_key": session_key,
+                    })
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.exception("bus_outbound_loop crashed: {}", e)
+
     recv = asyncio.create_task(receive_loop())
     send = asyncio.create_task(send_loop())
+    bus_out = asyncio.create_task(bus_outbound_loop())
 
     try:
         done, _pending = await asyncio.wait(
-            [recv, send], return_when=asyncio.FIRST_COMPLETED,
+            [recv, send, bus_out], return_when=asyncio.FIRST_COMPLETED,
         )
         for t in done:
             if t.exception() is not None:
@@ -346,16 +427,20 @@ async def websocket_chat(websocket: WebSocket):
                 task.cancel()
         recv.cancel()
         send.cancel()
+        bus_out.cancel()
 
 
 def main():
     """CLI entry point."""
     import argparse
+    global _gateway_port
 
     parser = argparse.ArgumentParser(description="nanobot gateway bridge")
     parser.add_argument("--port", type=int, default=18790)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+
+    _gateway_port = args.port
 
     uvicorn.run(
         "nanobot.gateway_bridge.server:app",

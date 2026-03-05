@@ -190,7 +190,10 @@ class NanobotAgent:
     )
 
     async def get_history(self, session_id: str) -> list[dict]:
-        """Get chat history for a session, stripping internal steering metadata."""
+        """Get chat history for a session, stripping internal steering metadata
+        and surfacing media from message tool calls."""
+        import json as _json
+
         if self._agent is None:
             await self.start()
         session = self._agent.sessions.get_or_create(session_id)
@@ -200,8 +203,32 @@ class NanobotAgent:
             content = msg.get("content", "")
             if msg["role"] == "user" and isinstance(content, str) and content.startswith(self._STEERING_PREFIX):
                 content = content[len(self._STEERING_PREFIX):]
+
+            # Extract media from message tool calls and append as markdown
+            if msg["role"] == "assistant" and msg.get("tool_calls"):
+                media_md = self._extract_message_tool_media(msg["tool_calls"])
+                if media_md:
+                    content = (content or "") + media_md
+
             out.append({"role": msg["role"], "content": content})
         return out
+
+    @staticmethod
+    def _extract_message_tool_media(tool_calls: list) -> str:
+        """Extract media file paths from message tool calls, return as markdown."""
+        import json as _json
+        parts = []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            if fn.get("name") != "message":
+                continue
+            try:
+                args = _json.loads(fn.get("arguments", "{}"))
+            except (ValueError, TypeError):
+                continue
+            for path in args.get("media", []):
+                parts.append(f"\n![image]({path})")
+        return "".join(parts)
 
     async def abort(self, session_id: str) -> bool:
         """Abort a running task.
