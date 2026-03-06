@@ -1,8 +1,9 @@
 """Nanobot agent wrapper for gateway bridge."""
 
 import asyncio
+import json
 import uuid
-from typing import AsyncGenerator, Callable
+from typing import Any, AsyncGenerator, Callable
 
 from loguru import logger
 
@@ -202,10 +203,9 @@ class NanobotAgent:
         all_msgs = session.messages[-max_messages:] if len(session.messages) > max_messages else session.messages
 
         out = []
+        pending_tools: dict[str, dict[str, Any]] = {}
         for msg in all_msgs:
             role = msg.get("role", "")
-            if role not in ("user", "assistant"):
-                continue
 
             content = msg.get("content", "")
             if not isinstance(content, str):
@@ -214,43 +214,79 @@ class NanobotAgent:
             if role == "user" and content.startswith(self._STEERING_PREFIX):
                 content = content[len(self._STEERING_PREFIX):]
 
-            if role == "assistant" and msg.get("tool_calls"):
-                msg_text, media_md = self._extract_message_tool_content(msg["tool_calls"])
-                if msg_text or media_md:
-                    if msg_text:
-                        content = msg_text
-                    if media_md:
-                        content = (content or "") + media_md
-                else:
-                    continue
-
-            if not content:
+            if role == "user":
+                if content:
+                    out.append({"role": role, "content": content})
                 continue
 
-            out.append({"role": role, "content": content})
+            if role == "assistant":
+                tool_calls = msg.get("tool_calls") or []
+                if content:
+                    out.append({"role": role, "content": content})
+
+                for tc in tool_calls:
+                    tool_entry = self._build_tool_entry(tc)
+                    out.append(tool_entry)
+                    if tool_entry.get("toolCallId"):
+                        pending_tools[tool_entry["toolCallId"]] = tool_entry
+
+                    message_content = self._extract_message_tool_content(tc)
+                    if message_content:
+                        out.append({"role": "assistant", "content": message_content})
+                continue
+
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                tool_entry = pending_tools.get(tool_call_id)
+                if tool_entry is None:
+                    tool_entry = {
+                        "role": "tool",
+                        "name": msg.get("name") or "tool",
+                        "toolCallId": tool_call_id,
+                        "phase": "end",
+                    }
+                    out.append(tool_entry)
+                    if tool_call_id:
+                        pending_tools[tool_call_id] = tool_entry
+
+                tool_entry["name"] = msg.get("name") or tool_entry.get("name") or "tool"
+                tool_entry["phase"] = "end"
+                if content:
+                    tool_entry["result"] = content
+                continue
+
         return out
 
     @staticmethod
-    def _extract_message_tool_content(tool_calls: list) -> tuple[str, str]:
-        """Extract text content and media from message tool calls.
-        Returns (text_content, media_markdown)."""
-        import json as _json
-        texts = []
-        media_parts = []
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            if fn.get("name") != "message":
-                continue
-            try:
-                args = _json.loads(fn.get("arguments", "{}"))
-            except (ValueError, TypeError):
-                continue
-            text = args.get("content", "")
-            if text:
-                texts.append(text)
-            for path in args.get("media", []):
-                media_parts.append(f"\n![image]({path})")
-        return "\n".join(texts), "".join(media_parts)
+    def _build_tool_entry(tool_call: dict) -> dict[str, Any]:
+        """Convert a stored tool call into a persistent tool-card item."""
+        fn = tool_call.get("function", {})
+        return {
+            "role": "tool",
+            "name": fn.get("name") or "tool",
+            "toolCallId": tool_call.get("id"),
+            "args": fn.get("arguments", ""),
+            "phase": "end",
+        }
+
+    @staticmethod
+    def _extract_message_tool_content(tool_call: dict) -> str:
+        """Build a standalone assistant bubble from one message tool call."""
+        fn = tool_call.get("function", {})
+        if fn.get("name") != "message":
+            return ""
+
+        try:
+            args = json.loads(fn.get("arguments", "{}"))
+        except (ValueError, TypeError):
+            return ""
+
+        text = args.get("content", "") or ""
+        media_parts = [f"\n![image]({path})" for path in args.get("media", []) if path]
+        media_md = "".join(media_parts)
+        if text and media_md:
+            return f"{text}{media_md}"
+        return text or media_md.lstrip("\n")
 
     async def abort(self, session_id: str) -> bool:
         """Abort a running task.
