@@ -189,33 +189,45 @@ class NanobotAgent:
         "new request, or address both.]\n\n"
     )
 
-    async def get_history(self, session_id: str) -> list[dict]:
-        """Get chat history for a session, stripping internal steering metadata
-        and surfacing media from message tool calls."""
-        import json as _json
+    async def get_history(self, session_id: str, max_messages: int = 500) -> list[dict]:
+        """Get full chat history for UI display.
 
+        Unlike session.get_history() (which only returns unconsolidated
+        messages for LLM input), this reads session.messages directly so
+        users can scroll back through their entire conversation.
+        """
         if self._agent is None:
             await self.start()
         session = self._agent.sessions.get_or_create(session_id)
-        messages = session.get_history()
+        all_msgs = session.messages[-max_messages:] if len(session.messages) > max_messages else session.messages
+
         out = []
-        for msg in messages:
+        for msg in all_msgs:
+            role = msg.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+
             content = msg.get("content", "")
-            if msg["role"] == "user" and isinstance(content, str) and content.startswith(self._STEERING_PREFIX):
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+
+            if role == "user" and content.startswith(self._STEERING_PREFIX):
                 content = content[len(self._STEERING_PREFIX):]
 
-            # Extract content + media from message tool calls
-            if msg["role"] == "assistant" and msg.get("tool_calls"):
+            if role == "assistant" and msg.get("tool_calls"):
                 msg_text, media_md = self._extract_message_tool_content(msg["tool_calls"])
-                if msg_text:
-                    if not content or content.strip() in ("", "..."):
+                if msg_text or media_md:
+                    if msg_text:
                         content = msg_text
-                    else:
-                        content = content + "\n" + msg_text
-                if media_md:
-                    content = (content or "") + media_md
+                    if media_md:
+                        content = (content or "") + media_md
+                else:
+                    continue
 
-            out.append({"role": msg["role"], "content": content})
+            if not content:
+                continue
+
+            out.append({"role": role, "content": content})
         return out
 
     @staticmethod
