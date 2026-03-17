@@ -956,6 +956,7 @@ def run_onboard() -> Config:
                 choices=[
                     "🔌 Configure LLM Provider",
                     "💬 Configure Chat Channel",
+                    "⚙️ Configure Channel Common",
                     "🤖 Configure Agent Settings",
                     "🌐 Configure Gateway",
                     "🔧 Configure Tools",
@@ -969,6 +970,8 @@ def run_onboard() -> Config:
                 _configure_providers(config)
             elif answer == "💬 Configure Chat Channel":
                 _configure_channels(config)
+            elif answer == "⚙️ Configure Channel Common":
+                _configure_general_settings(config, "Channel Common")
             elif answer == "🤖 Configure Agent Settings":
                 _configure_agents(config)
             elif answer == "🌐 Configure Gateway":
