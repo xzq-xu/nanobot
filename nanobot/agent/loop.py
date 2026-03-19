@@ -524,7 +524,11 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             if self._restore_runtime_checkpoint(session):
                 self.sessions.save(session)
-            await self.consolidator.maybe_consolidate_by_tokens(session)
+            trimmed = self.consolidator.fast_trim_if_needed(session)
+            if trimmed:
+                self._schedule_background(
+                    self.consolidator.archive_trimmed_chunk(session.key, trimmed)
+                )
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -558,7 +562,11 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.consolidator.maybe_consolidate_by_tokens(session)
+        trimmed = self.consolidator.fast_trim_if_needed(session)
+        if trimmed:
+            self._schedule_background(
+                self.consolidator.archive_trimmed_chunk(session.key, trimmed)
+            )
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
