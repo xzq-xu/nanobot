@@ -256,6 +256,7 @@ class FeishuConfig(Base):
 
 _STREAM_ELEMENT_ID = "streaming_md"
 
+
 @dataclass
 class _FeishuStreamBuf:
     """Per-chat streaming accumulator using CardKit streaming API."""
