@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
-import sys
+import os
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
-from nanobot import __version__
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.messages import AgentMessage
@@ -29,7 +27,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.utils.helpers import build_status_content
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -96,7 +94,6 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
 
-        # Dual-layer architecture (opt-in)
         self.enable_steering = enable_steering
         self._transform_context = transform_context
         self._convert_to_llm = convert_to_llm or AgentMessage.to_llm_list
@@ -122,8 +119,13 @@ class AgentLoop:
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
+        _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
+        self._concurrency_gate: asyncio.Semaphore | None = (
+            asyncio.Semaphore(_max) if _max > 0 else None
+        )
         self._interrupt_checkers: dict[str, InterruptionChecker] = {}
-        self._processing_lock = asyncio.Lock()
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -135,6 +137,8 @@ class AgentLoop:
             max_completion_tokens=provider.generation.max_tokens,
         )
         self._register_default_tools()
+        self.commands = CommandRouter()
+        register_builtin_commands(self.commands)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -188,7 +192,7 @@ class AgentLoop:
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
+        """Remove think-tag blocks that some models embed in content."""
         if not text:
             return None
         from nanobot.utils.helpers import strip_think
@@ -197,55 +201,25 @@ class AgentLoop:
     def _tool_hint(self, tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         workspace_str = str(self.workspace)
-        
+
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
-            
             val = None
             if isinstance(args, dict):
-                # Iterate through all string values to find the first meaningful one
                 for v in args.values():
                     if isinstance(v, str):
                         val = v
                         break
-                            
             if not isinstance(val, str):
                 return tc.name
-                
             if self.restrict_to_workspace:
-                import os
-                # If it looks like an absolute path, normalize it to resolve '..' and '.'
                 if os.path.isabs(val):
                     val = os.path.normpath(val)
-                # Replace workspace path with empty string to hide it
                 if workspace_str in val:
                     val = val.replace(workspace_str, "").lstrip("\\/")
-                
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
-            
-        return ", ".join(_fmt(tc) for tc in tool_calls)
 
-    def _status_response(self, msg: InboundMessage, session: Session) -> OutboundMessage:
-        """Build an outbound status message for a session."""
-        ctx_est = 0
-        try:
-            ctx_est, _ = self.memory_consolidator.estimate_session_prompt_tokens(session)
-        except Exception:
-            pass
-        if ctx_est <= 0:
-            ctx_est = self._last_usage.get("prompt_tokens", 0)
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=build_status_content(
-                version=__version__, model=self.model,
-                start_time=self._start_time, last_usage=self._last_usage,
-                context_window_tokens=self.context_window_tokens,
-                session_msg_count=len(session.get_history(max_messages=0)),
-                context_tokens_estimate=ctx_est,
-            ),
-            metadata={"render_as": "text"},
-        )
+        return ", ".join(_fmt(tc) for tc in tool_calls)
 
     async def _run_agent_loop(
         self,
@@ -255,18 +229,16 @@ class AgentLoop:
         interruption_checker: InterruptionChecker | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        *,
+        channel: str = "cli",
+        chat_id: str = "direct",
+        message_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
-        *on_turn_saved*, when provided, is called with the full message
-        list after each tool-call iteration so the caller can persist
-        intermediate state.  This prevents data loss if the loop is
-        interrupted mid-way (e.g. /stop, crash).
+        *on_turn_saved* persists the message list after each tool iteration when set.
 
-        *on_stream*: called with each content delta during streaming.
-        *on_stream_end(resuming)*: called when a streaming session finishes.
-        ``resuming=True`` means tool calls follow (spinner should restart);
-        ``resuming=False`` means this is the final response.
+        *on_stream* / *on_stream_end* control streaming UX (deltas and segment boundaries).
         """
         messages = initial_messages
         iteration = 0
@@ -274,7 +246,6 @@ class AgentLoop:
         tools_used: list[str] = []
 
         def _drain_interruptions() -> str | None:
-            """Drain pending interruptions into a combined user message, or None."""
             if not interruption_checker:
                 return None
             pending = interruption_checker.drain_all()
@@ -287,8 +258,6 @@ class AgentLoop:
                 "new request, or address both.]\n\n" + combined
             )
 
-        # Wrap on_stream with stateful think-tag filter so downstream
-        # consumers (CLI, channels) never see think-tag content in the stream.
         _raw_stream = on_stream
         _stream_buf = ""
 
@@ -307,12 +276,10 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
-            # Steering: check for interruptions before LLM call
             if injection := _drain_interruptions():
                 messages.append({"role": "user", "content": injection})
                 logger.info("Steering: injected interruption before LLM call")
 
-            # Context hooks: transform before LLM call (opt-in)
             if self._transform_context:
                 agent_msgs = AgentMessage.from_dict_list(messages)
                 agent_msgs = self._transform_context(agent_msgs)
@@ -364,9 +331,11 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                # Steering: check before launching tools — cancel all on interruption
                 if injection := _drain_interruptions():
-                    logger.info("Steering: interruption before tools, cancelling {} tools", len(response.tool_calls))
+                    logger.info(
+                        "Steering: interruption before tools, cancelling {} tools",
+                        len(response.tool_calls),
+                    )
                     for tc in response.tool_calls:
                         messages = self.context.add_tool_result(
                             messages, tc.id, tc.name, "CANCELLED: User interrupted",
@@ -382,6 +351,8 @@ class AgentLoop:
                     tools_used.append(tc.name)
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
+
+                self._set_tool_context(channel, chat_id, message_id)
 
                 results = await asyncio.gather(*(
                     self.tools.execute(tc.name, tc.arguments)
@@ -444,67 +415,35 @@ class AgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
-            cmd = msg.content.strip().lower()
-            if cmd == "/stop":
-                await self._handle_stop(msg)
-            elif cmd == "/restart":
-                await self._handle_restart(msg)
+            raw = msg.content.strip()
+            if self.commands.is_priority(raw):
+                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+                result = await self.commands.dispatch_priority(ctx)
+                if result:
+                    await self.bus.publish_outbound(result)
                 continue
-            elif cmd == "/status":
-                session = self.sessions.get_or_create(msg.session_key)
-                await self.bus.publish_outbound(self._status_response(msg, session))
-            else:
-                # Steering: if this session already has an active task, signal interruption
-                # instead of queuing a new task.  The running loop will merge the message.
-                if self.enable_steering:
-                    active = [t for t in self._active_tasks.get(msg.session_key, []) if not t.done()]
-                    if active and msg.session_key in self._interrupt_checkers:
-                        await self._interrupt_checkers[msg.session_key].signal(msg)
-                        logger.info("Steering: signaled interruption for {}", msg.session_key)
-                        continue
 
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            if self.enable_steering:
+                active = [t for t in self._active_tasks.get(msg.session_key, []) if not t.done()]
+                if active and msg.session_key in self._interrupt_checkers:
+                    await self._interrupt_checkers[msg.session_key].signal(msg)
+                    logger.info("Steering: signaled interruption for {}", msg.session_key)
+                    continue
 
-    async def _handle_stop(self, msg: InboundMessage) -> None:
-        """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
-        total = cancelled + sub_cancelled
-        content = f"Stopped {total} task(s)." if total else "No active task to stop."
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
-        ))
-
-    async def _handle_restart(self, msg: InboundMessage) -> None:
-        """Restart the process in-place via os.execv."""
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content="Restarting...",
-        ))
-
-        async def _do_restart():
-            await asyncio.sleep(1)
-            # Use -m nanobot instead of sys.argv[0] for Windows compatibility
-            # (sys.argv[0] may be just "nanobot" without full path on Windows)
-            os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
-
-        asyncio.create_task(_do_restart())
+            task = asyncio.create_task(self._dispatch(msg))
+            self._active_tasks.setdefault(msg.session_key, []).append(task)
+            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
+        """Process a message: per-session serial, cross-session concurrent."""
         checker: InterruptionChecker | None = None
         if self.enable_steering:
             checker = InterruptionChecker()
             self._interrupt_checkers[msg.session_key] = checker
 
-        async with self._processing_lock:
+        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        gate = self._concurrency_gate or nullcontext()
+        async with lock, gate:
             try:
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
@@ -544,10 +483,9 @@ class AgentLoop:
                 ))
             finally:
                 if self.enable_steering:
-                    checker = self._interrupt_checkers.pop(msg.session_key, None)
-                    # Re-publish orphaned messages so they're processed as new tasks
-                    if checker:
-                        for orphan in checker.drain_all():
+                    popped = self._interrupt_checkers.pop(msg.session_key, None)
+                    if popped:
+                        for orphan in popped.drain_all():
                             logger.info("Steering: re-queuing orphaned message for {}", msg.session_key)
                             await self.bus.publish_inbound(orphan)
 
@@ -570,14 +508,7 @@ class AgentLoop:
         task.add_done_callback(self._background_tasks.remove)
 
     def _maybe_consolidate_bg(self, session: Session) -> None:
-        """Non-blocking consolidation: quick token check, background if over threshold.
-
-        The per-session lock inside maybe_consolidate_by_tokens prevents
-        concurrent consolidation runs.  If the current request proceeds
-        with a slightly oversized context, the LLM provider's context-window
-        limit acts as a safety net, and the background task will trim the
-        session for subsequent requests.
-        """
+        """Schedule consolidation in the background when context is oversized."""
         mc = self.memory_consolidator
         if not session.messages or mc.context_window_tokens <= 0:
             return
@@ -624,15 +555,19 @@ class AgentLoop:
                 current_role=current_role,
             )
             save_offset = [1 + len(history)]
-            def _incremental_save(msgs: list[dict]) -> None:
+
+            def _incremental_save_sys(msgs: list[dict]) -> None:
                 self._save_turn(session, msgs, save_offset[0])
                 save_offset[0] = len(msgs)
                 self.sessions.save(session)
 
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages,
-                on_turn_saved=_incremental_save,
+                on_turn_saved=_incremental_save_sys,
                 interruption_checker=interruption_checker,
+                channel=channel,
+                chat_id=chat_id,
+                message_id=msg.metadata.get("message_id"),
             )
             self._save_turn(session, all_msgs, save_offset[0])
             self.sessions.save(session)
@@ -647,35 +582,11 @@ class AgentLoop:
         session = self.sessions.get_or_create(key)
 
         # Slash commands
-        cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            snapshot = session.messages[session.last_consolidated:]
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
+        raw = msg.content.strip()
+        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+        if result := await self.commands.dispatch(ctx):
+            return result
 
-            if snapshot:
-                self._schedule_background(self.memory_consolidator.archive_messages(snapshot))
-
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
-        if cmd == "/status":
-            return self._status_response(msg, session)
-        if cmd == "/help":
-            lines = [
-                "🐈 nanobot commands:",
-                "/new — Start a new conversation",
-                "/stop — Stop the current task",
-                "/restart — Restart the bot",
-                "/status — Show bot status",
-                "/help — Show available commands",
-            ]
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="\n".join(lines),
-                metadata={"render_as": "text"},
-            )
         self._maybe_consolidate_bg(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
@@ -700,6 +611,7 @@ class AgentLoop:
             ))
 
         save_offset = [1 + len(history)]
+
         def _incremental_save(msgs: list[dict]) -> None:
             self._save_turn(session, msgs, save_offset[0])
             save_offset[0] = len(msgs)
@@ -712,6 +624,8 @@ class AgentLoop:
             interruption_checker=interruption_checker,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
+            channel=msg.channel, chat_id=msg.chat_id,
+            message_id=msg.metadata.get("message_id"),
         )
 
         if final_content is None:
@@ -825,12 +739,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly and return the outbound payload.
-
-        When *interruption_checker* is supplied, the inner agent loop will
-        check for pending messages at each tool boundary and before each
-        LLM call, enabling real-time steering without cancelling the task.
-        """
+        """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(

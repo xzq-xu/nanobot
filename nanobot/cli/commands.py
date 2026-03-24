@@ -318,7 +318,7 @@ def onboard(
             console.print(f"[green]✓[/green] Created config at {config_path}")
 
     if wizard and not non_interactive:
-        from nanobot.cli.onboard_wizard import run_onboard
+        from nanobot.cli.onboard import run_onboard
 
         try:
             result = run_onboard(initial_config=config)
