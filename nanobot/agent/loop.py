@@ -284,18 +284,26 @@ class AgentLoop:
                 messages, turn_start_index, iteration,
             )
 
+            async def _on_llm_retry(attempt: int, total: int) -> None:
+                if on_progress:
+                    await on_progress(
+                        f"AI service temporarily unavailable, retrying ({attempt}/{total})…",
+                    )
+
             if on_stream:
                 response = await self.provider.chat_stream_with_retry(
                     messages=send_messages,
                     tools=tool_defs,
                     model=self.model,
                     on_content_delta=_filtered_stream,
+                    on_retry=_on_llm_retry,
                 )
             else:
                 response = await self.provider.chat_with_retry(
                     messages=send_messages,
                     tools=tool_defs,
                     model=self.model,
+                    on_retry=_on_llm_retry,
                 )
             usage = response.usage or {}
             self._last_usage = {
