@@ -88,6 +88,20 @@ class _LoopHook(AgentHook):
             await self._on_stream_end(resuming=resuming)
         self._stream_buf = ""
 
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        if not self._interruption_checker:
+            return
+        pending = self._interruption_checker.drain_all()
+        if pending:
+            combined = "\n\n---\n\n".join(m.content for m in pending)
+            injection = (
+                "[The user just sent a new message while you were working. "
+                "Read it and decide: continue current work, switch to the "
+                "new request, or address both.]\n\n" + combined
+            )
+            context.messages.append({"role": "user", "content": injection})
+            logger.info("Steering: injected {} interruption(s) before LLM call", len(pending))
+
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         if self._on_progress:
             if not self._on_stream:
