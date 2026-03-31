@@ -105,10 +105,7 @@ class AgentRunner:
             context.tool_calls = list(response.tool_calls)
 
             if response.has_tool_calls:
-                async def _on_retry(attempt: int, total: int) -> None:
-                await hook.on_llm_retry(context, attempt, total)
-
-            if hook.wants_streaming():
+                if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
 
                 messages.append(build_assistant_message(
@@ -141,9 +138,6 @@ class AgentRunner:
                     })
                 await hook.after_iteration(context)
                 continue
-
-            async def _on_retry(attempt: int, total: int) -> None:
-                await hook.on_llm_retry(context, attempt, total)
 
             if hook.wants_streaming():
                 await hook.on_stream_end(context, resuming=False)
