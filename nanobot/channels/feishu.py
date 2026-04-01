@@ -1067,6 +1067,7 @@ class FeishuChannel(BaseChannel):
                 await loop.run_in_executor(
                     None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence,
                 )
+                # Required so the chat list preview exits the streaming placeholder (Feishu streaming card docs).
                 buf.sequence += 1
                 await loop.run_in_executor(
                     None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
