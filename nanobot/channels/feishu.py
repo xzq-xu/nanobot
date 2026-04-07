@@ -252,6 +252,7 @@ class FeishuConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
     streaming: bool = True
+    bot_open_id: str = ""  # Bot's own open_id for precise @ mention detection (auto-populated)
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
@@ -299,12 +300,36 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
+        self._bot_open_id: str | None = None  # Cached bot open_id for @ mention detection
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
         """Register an event handler only when the SDK supports it."""
         method = getattr(builder, method_name, None)
         return method(handler) if callable(method) else builder
+
+    def _get_bot_open_id_sync(self) -> str | None:
+        """Get the bot's own open_id via /bot/v3/info API."""
+        if not self._client:
+            return None
+        try:
+            from lark_oapi.api.bot.v3 import GetBotInfoRequest
+            request = GetBotInfoRequest.builder().build()
+            response = self._client.bot.v3.bot_info.get(request)
+            if response.success():
+                bot_info = response.data
+                # The response structure: bot -> { open_id, user_id, ... }
+                open_id = getattr(bot_info, "open_id", None)
+                if open_id:
+                    logger.info("Feishu bot open_id: {}", open_id)
+                    return open_id
+                else:
+                    logger.warning("Feishu bot info response missing open_id")
+            else:
+                logger.warning("Failed to get bot info: code={}, msg={}", response.code, response.msg)
+        except Exception as e:
+            logger.warning("Error getting bot open_id: {}", e)
+        return None
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -326,6 +351,12 @@ class FeishuChannel(BaseChannel):
             .app_secret(self.config.app_secret) \
             .log_level(lark.LogLevel.INFO) \
             .build()
+
+        # Fetch and cache bot's own open_id for accurate @ mention detection
+        self._bot_open_id = self._get_bot_open_id_sync()
+        if not self._bot_open_id:
+            logger.warning("Failed to get bot open_id; @ mention detection may be less reliable")
+
         builder = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
             self.config.verification_token or "",
@@ -398,17 +429,25 @@ class FeishuChannel(BaseChannel):
         logger.info("Feishu bot stopped")
 
     def _is_bot_mentioned(self, message: Any) -> bool:
-        """Check if the bot is @mentioned in the message."""
+        """Check if the bot is @mentioned in the message by exact open_id match."""
+        # Check for @_all (everyone) mention in raw content
         raw_content = message.content or ""
         if "@_all" in raw_content:
             return True
+
+        # Require exact open_id match - no heuristics
+        bot_open_id = self.config.bot_open_id or self._bot_open_id
+        if not bot_open_id:
+            # If we don't know our own open_id, be conservative and don't respond
+            logger.warning("bot_open_id not set; skipping @ mention check to avoid false positives")
+            return False
 
         for mention in getattr(message, "mentions", None) or []:
             mid = getattr(mention, "id", None)
             if not mid:
                 continue
-            # Bot mentions have no user_id (None or "") but a valid open_id
-            if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
+            mention_open_id = getattr(mid, "open_id", None)
+            if mention_open_id == bot_open_id:
                 return True
         return False
 
