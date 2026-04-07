@@ -6,7 +6,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
@@ -63,17 +63,15 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
 class CronService:
     """Service for managing and executing scheduled jobs."""
 
-    _MAX_RUN_HISTORY = 20  # Max run history records to keep per job
+    _MAX_RUN_HISTORY = 20
 
     def __init__(
         self,
         store_path: Path,
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
-        max_run_history: int | None = None,
     ):
         self.store_path = store_path
         self.on_job = on_job
-        self.max_run_history = max_run_history or self._MAX_RUN_HISTORY
         self._store: CronStore | None = None
         self._last_mtime: float = 0.0
         self._timer_task: asyncio.Task | None = None
@@ -286,14 +284,13 @@ class CronService:
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms = end_ms
 
-        # Record run history (keep last N entries per max_run_history)
         job.state.run_history.append(CronRunRecord(
             run_at_ms=start_ms,
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
         ))
-        job.state.run_history = job.state.run_history[-self.max_run_history:]
+        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 
         # Handle one-shot jobs
         if job.schedule.kind == "at":
@@ -368,9 +365,16 @@ class CronService:
         logger.info("Cron: registered system job '{}' ({})", job.name, job.id)
         return job
 
-    def remove_job(self, job_id: str) -> bool:
-        """Remove a job by ID."""
+    def remove_job(self, job_id: str) -> Literal["removed", "protected", "not_found"]:
+        """Remove a job by ID, unless it is a protected system job."""
         store = self._load_store()
+        job = next((j for j in store.jobs if j.id == job_id), None)
+        if job is None:
+            return "not_found"
+        if job.payload.kind == "system_event":
+            logger.info("Cron: refused to remove protected system job {}", job_id)
+            return "protected"
+
         before = len(store.jobs)
         store.jobs = [j for j in store.jobs if j.id != job_id]
         removed = len(store.jobs) < before
@@ -379,8 +383,9 @@ class CronService:
             self._save_store()
             self._arm_timer()
             logger.info("Cron: removed job {}", job_id)
+            return "removed"
 
-        return removed
+        return "not_found"
 
     def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
         """Enable or disable a job."""

@@ -3,7 +3,7 @@
 import pytest
 from pathlib import Path
 
-from nanobot.agent.git_store import GitStore, CommitInfo
+from nanobot.utils.gitstore import GitStore, CommitInfo
 
 
 TRACKED = ["SOUL.md", "USER.md", "memory/MEMORY.md"]
@@ -181,7 +181,7 @@ class TestShowCommitDiff:
 
 class TestCommitInfoFormat:
     def test_format_with_diff(self):
-        from nanobot.agent.git_store import CommitInfo
+        from nanobot.utils.gitstore import CommitInfo
         c = CommitInfo(sha="abcd1234", message="test commit\nsecond line", timestamp="2026-04-02 12:00")
         result = c.format(diff="some diff")
         assert "test commit" in result
@@ -189,7 +189,7 @@ class TestCommitInfoFormat:
         assert "some diff" in result
 
     def test_format_without_diff(self):
-        from nanobot.agent.git_store import CommitInfo
+        from nanobot.utils.gitstore import CommitInfo
         c = CommitInfo(sha="abcd1234", message="test", timestamp="2026-04-02 12:00")
         result = c.format()
         assert "(no file changes)" in result
@@ -199,15 +199,24 @@ class TestRevert:
     def test_returns_none_when_not_initialized(self, git):
         assert git.revert("abc") is None
 
-    def test_reverts_file_content(self, git_ready):
+    def test_undoes_commit_changes(self, git_ready):
+        """revert(sha) should undo the given commit by restoring to its parent."""
         ws = git_ready._workspace
         (ws / "SOUL.md").write_text("v2 content", encoding="utf-8")
         git_ready.auto_commit("v2")
 
         commits = git_ready.log()
-        new_sha = git_ready.revert(commits[1].sha)  # revert to init
+        # commits[0] = v2 (HEAD), commits[1] = init
+        # Revert v2 → restore to init's state (empty SOUL.md)
+        new_sha = git_ready.revert(commits[0].sha)
         assert new_sha is not None
         assert (ws / "SOUL.md").read_text(encoding="utf-8") == ""
+
+    def test_root_commit_returns_none(self, git_ready):
+        """Cannot revert the root commit (no parent to restore to)."""
+        commits = git_ready.log()
+        assert len(commits) == 1
+        assert git_ready.revert(commits[0].sha) is None
 
     def test_invalid_sha_returns_none(self, git_ready):
         assert git_ready.revert("deadbeef") is None

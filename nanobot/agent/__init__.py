@@ -12,7 +12,6 @@ __all__ = [
     "AgentHookContext",
     "AgentLoop",
     "CompositeHook",
-    "Consolidator",
     "ContextBuilder",
     "Dream",
     "MemoryStore",

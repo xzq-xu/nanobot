@@ -238,10 +238,11 @@ class GitStore:
     # -- restore ---------------------------------------------------------------
 
     def revert(self, commit: str) -> str | None:
-        """Restore all tracked memory files to their state at the given commit.
+        """Revert (undo) the changes introduced by the given commit.
 
-        This reads the file contents from the target commit, writes them back,
-        and creates a new commit. Does not require merge3.
+        Restores all tracked memory files to the state at the commit's parent,
+        then creates a new commit recording the revert.
+
         Returns the new commit SHA, or None on failure.
         """
         if not self.is_initialized():
@@ -255,13 +256,20 @@ class GitStore:
                 logger.warning("Git revert: SHA not found: {}", commit)
                 return None
 
-            restored: list[str] = []
             with Repo(str(self._workspace)) as repo:
                 commit_obj = repo[full_sha]
                 if commit_obj.type_name != b"commit":
                     return None
-                tree = repo[commit_obj.tree]
 
+                if not commit_obj.parents:
+                    logger.warning("Git revert: cannot revert root commit {}", commit)
+                    return None
+
+                # Use the parent's tree — this undoes the commit's changes
+                parent_obj = repo[commit_obj.parents[0]]
+                tree = repo[parent_obj.tree]
+
+                restored: list[str] = []
                 for filepath in self._tracked_files:
                     content = self._read_blob_from_tree(repo, tree, filepath)
                     if content is not None:
@@ -273,7 +281,7 @@ class GitStore:
                 return None
 
             # Commit the restored state
-            msg = f"revert: restore to {commit}"
+            msg = f"revert: undo {commit}"
             return self.auto_commit(msg)
         except Exception:
             logger.warning("Git revert failed for {}", commit)
