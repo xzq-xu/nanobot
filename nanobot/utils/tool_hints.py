@@ -17,25 +17,30 @@ _TOOL_FORMATS: dict[str, tuple[list[str], str]] = {
 
 
 def format_tool_hints(tool_calls: list) -> str:
-    """Format tool calls as concise hints with smart abbreviation."""
+    """Format tool calls as concise hints with smart deduplication."""
     if not tool_calls:
         return ""
 
-    hints = []
-    for name, count, example_tc in _group_consecutive(tool_calls):
-        fmt = _TOOL_FORMATS.get(name)
+    formatted = []
+    for tc in tool_calls:
+        fmt = _TOOL_FORMATS.get(tc.name)
         if fmt:
-            hint = _fmt_known(example_tc, fmt)
-        elif name.startswith("mcp_"):
-            hint = _fmt_mcp(example_tc)
+            formatted.append(_fmt_known(tc, fmt))
+        elif tc.name.startswith("mcp_"):
+            formatted.append(_fmt_mcp(tc))
         else:
-            hint = _fmt_fallback(example_tc)
+            formatted.append(_fmt_fallback(tc))
 
-        if count > 1:
-            hint = f"{hint} \u00d7 {count}"
-        hints.append(hint)
+    groups: list[tuple[str, int]] = []
+    for hint in formatted:
+        if groups and groups[-1][0] == hint:
+            groups[-1] = (hint, groups[-1][1] + 1)
+        else:
+            groups.append((hint, 1))
 
-    return ", ".join(hints)
+    return ", ".join(
+        f"{h} \u00d7 {c}" if c > 1 else h for h, c in groups
+    )
 
 
 def _get_args(tc) -> dict:
@@ -48,16 +53,6 @@ def _get_args(tc) -> dict:
         return tc.arguments
     return {}
 
-
-def _group_consecutive(calls: list) -> list[tuple[str, int, object]]:
-    """Group consecutive calls to the same tool: [(name, count, first), ...]."""
-    groups: list[tuple[str, int, object]] = []
-    for tc in calls:
-        if groups and groups[-1][0] == tc.name:
-            groups[-1] = (groups[-1][0], groups[-1][1] + 1, groups[-1][2])
-        else:
-            groups.append((tc.name, 1, tc))
-    return groups
 
 
 def _extract_arg(tc, key_args: list[str]) -> str | None:
