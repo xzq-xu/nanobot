@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import time
@@ -40,6 +41,11 @@ from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
     from nanobot.cron.service import CronService
+
+
+
+UNIFIED_SESSION_KEY = "unified:default"
+
 
 class _LoopHook(AgentHook):
     """Core hook for the main loop."""
@@ -148,6 +154,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
+        unified_session: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -194,7 +201,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
-
+        self._unified_session = unified_session
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
@@ -244,6 +251,7 @@ class AgentLoop:
                 restrict_to_workspace=self.restrict_to_workspace,
                 sandbox=self.exec_config.sandbox,
                 path_append=self.exec_config.path_append,
+                allowed_env_keys=self.exec_config.allowed_env_keys,
             ))
         if self.web_config.enable:
             self.tools.register(WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
@@ -312,7 +320,7 @@ class AgentLoop:
         message_id: str | None = None,
         extra_hooks: list[AgentHook] | None = None,
         on_turn_saved: Callable[[list[dict]], None] | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+    ) -> tuple[str | None, list[str], list[dict], str]:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -368,7 +376,7 @@ class AgentLoop:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages
+        return result.final_content, result.tools_used, result.messages, result.stop_reason
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -403,14 +411,17 @@ class AgentLoop:
                 logger.info("Steering: signaled interruption for {}", msg.session_key)
                 continue
 
+            effective_key = UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
             task = asyncio.create_task(self._dispatch(msg))
-            self._active_tasks.setdefault(msg.session_key, []).append(task)
-            task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            self._active_tasks.setdefault(effective_key, []).append(task)
+            task.add_done_callback(lambda t, k=effective_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         checker = InterruptionChecker()
         self._interrupt_checkers[msg.session_key] = checker
+        if self._unified_session and not msg.session_key_override:
+            msg = dataclasses.replace(msg, session_key_override=UNIFIED_SESSION_KEY)
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         try:
@@ -533,7 +544,7 @@ class AgentLoop:
                 save_offset[0] = len(msgs)
                 self.sessions.save(session)
 
-            final_content, _, all_msgs = await self._run_agent_loop(
+            final_content, _, all_msgs, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
                 extra_hooks=extra_hooks,
@@ -594,7 +605,7 @@ class AgentLoop:
             save_offset[0] = len(msgs)
             self.sessions.save(session)
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, _, all_msgs, stop_reason = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -621,7 +632,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None:
+        if on_stream is not None and stop_reason != "error":
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
