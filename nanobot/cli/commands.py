@@ -477,6 +477,22 @@ def _make_provider(config: Config):
     return provider
 
 
+def _make_cli_provider_factory(config: Config):
+    """Build a cached factory for fallback model providers (CLI side)."""
+    from nanobot.nanobot import _make_provider_for_model
+
+    cache: dict[str, Any] = {}
+
+    def factory(model: str):
+        provider_name = config.get_provider_name(model)
+        key = provider_name or model
+        if key not in cache:
+            cache[key] = _make_provider_for_model(config, model)
+        return cache[key]
+
+    return factory
+
+
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
     from nanobot.config.loader import load_config, resolve_config_env_vars, set_config_path
@@ -572,28 +588,32 @@ def serve(
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(runtime_config)
+    defaults = runtime_config.agents.defaults
+    pf = _make_cli_provider_factory(runtime_config) if defaults.fallback_models else None
     session_manager = SessionManager(runtime_config.workspace_path)
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=runtime_config.workspace_path,
-        model=runtime_config.agents.defaults.model,
-        max_iterations=runtime_config.agents.defaults.max_tool_iterations,
-        context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
-        context_block_limit=runtime_config.agents.defaults.context_block_limit,
-        max_tool_result_chars=runtime_config.agents.defaults.max_tool_result_chars,
-        provider_retry_mode=runtime_config.agents.defaults.provider_retry_mode,
+        model=defaults.model,
+        max_iterations=defaults.max_tool_iterations,
+        context_window_tokens=defaults.context_window_tokens,
+        context_block_limit=defaults.context_block_limit,
+        max_tool_result_chars=defaults.max_tool_result_chars,
+        provider_retry_mode=defaults.provider_retry_mode,
+        fallback_models=defaults.fallback_models,
+        provider_factory=pf,
         web_config=runtime_config.tools.web,
         exec_config=runtime_config.tools.exec,
         restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=runtime_config.tools.mcp_servers,
         channels_config=runtime_config.channels,
-        timezone=runtime_config.agents.defaults.timezone,
-        unified_session=runtime_config.agents.defaults.unified_session,
+        timezone=defaults.timezone,
+        unified_session=defaults.unified_session,
     )
 
-    model_name = runtime_config.agents.defaults.model
+    model_name = defaults.model
     console.print(f"{__logo__} Starting OpenAI-compatible API server")
     console.print(f"  [cyan]Endpoint[/cyan] : http://{host}:{port}/v1/chat/completions")
     console.print(f"  [cyan]Model[/cyan]    : {model_name}")
@@ -653,6 +673,8 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    gw_defaults = config.agents.defaults
+    gw_pf = _make_cli_provider_factory(config) if gw_defaults.fallback_models else None
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -668,21 +690,23 @@ def gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
+        model=gw_defaults.model,
+        max_iterations=gw_defaults.max_tool_iterations,
+        context_window_tokens=gw_defaults.context_window_tokens,
         web_config=config.tools.web,
-        context_block_limit=config.agents.defaults.context_block_limit,
-        max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
-        provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        context_block_limit=gw_defaults.context_block_limit,
+        max_tool_result_chars=gw_defaults.max_tool_result_chars,
+        provider_retry_mode=gw_defaults.provider_retry_mode,
+        fallback_models=gw_defaults.fallback_models,
+        provider_factory=gw_pf,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
-        unified_session=config.agents.defaults.unified_session,
+        timezone=gw_defaults.timezone,
+        unified_session=gw_defaults.unified_session,
     )
 
     # Set cron callback (needs agent)
@@ -883,6 +907,8 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
+    chat_defaults = config.agents.defaults
+    chat_pf = _make_cli_provider_factory(config) if chat_defaults.fallback_models else None
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
@@ -901,20 +927,22 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
+        model=chat_defaults.model,
+        max_iterations=chat_defaults.max_tool_iterations,
+        context_window_tokens=chat_defaults.context_window_tokens,
         web_config=config.tools.web,
-        context_block_limit=config.agents.defaults.context_block_limit,
-        max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
-        provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        context_block_limit=chat_defaults.context_block_limit,
+        max_tool_result_chars=chat_defaults.max_tool_result_chars,
+        provider_retry_mode=chat_defaults.provider_retry_mode,
+        fallback_models=chat_defaults.fallback_models,
+        provider_factory=chat_pf,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
-        unified_session=config.agents.defaults.unified_session,
+        timezone=chat_defaults.timezone,
+        unified_session=chat_defaults.unified_session,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):
