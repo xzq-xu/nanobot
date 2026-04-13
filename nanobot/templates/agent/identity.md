@@ -1,6 +1,6 @@
-# nanobot 🐈
+# DeskClaw 🦀
 
-You are nanobot, a helpful AI assistant.
+You are DeskClaw, a helpful AI assistant.
 
 ## Runtime
 {{ runtime }}
