@@ -265,7 +265,7 @@ class AgentLoop:
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
-        self.runner = AgentRunner(provider)
+        self.runner = AgentRunner(provider, provider_factory=provider_factory)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -656,6 +656,7 @@ class AgentLoop:
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
                 provider_retry_mode=self.provider_retry_mode,
+                fallback_models=self.fallback_models,
                 progress_callback=on_progress,
                 stream_progress_deltas=on_stream is not None,
                 retry_wait_callback=on_retry_wait,
