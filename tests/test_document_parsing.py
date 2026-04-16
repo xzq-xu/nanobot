@@ -1,10 +1,8 @@
 """Tests for document text extraction utilities."""
 
-import io
 from pathlib import Path
 
 import pytest
-
 from nanobot.utils.document import (
     SUPPORTED_EXTENSIONS,
     _is_text_extension,

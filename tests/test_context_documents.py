@@ -37,7 +37,7 @@ def test_build_user_content_with_image_returns_list(tmp_path: Path) -> None:
 
 
 def test_build_user_content_ignores_non_image_files(tmp_path: Path) -> None:
-    """Non-image files should be skipped by the context builder."""
+    """Non-image files should be silently skipped — extraction is not context builder's job."""
     builder = _make_builder(tmp_path)
     txt = tmp_path / "notes.txt"
     txt.write_text("some text", encoding="utf-8")
@@ -59,9 +59,11 @@ def test_build_user_content_mixed_image_and_non_image(tmp_path: Path) -> None:
     text_parts = [b.get("text", "") for b in result if b.get("type") == "text"]
     assert all("report text" not in t for t in text_parts)
 
-
 def test_drain_pending_path_preserves_document_text(tmp_path: Path) -> None:
-    """Pending messages must extract documents before building user content."""
+    """Simulates the _drain_pending path: a pending follow-up message
+    with a document attachment must have its text extracted before being
+    passed to _build_user_content.  Without extract_documents, the
+    document is silently dropped."""
     from docx import Document
 
     doc = Document()
@@ -72,17 +74,21 @@ def test_drain_pending_path_preserves_document_text(tmp_path: Path) -> None:
     content = "summarize"
     media = [str(docx_path)]
 
+    # Step 1: extract_documents separates docs from images
     new_content, image_only = extract_documents(content, media)
 
+    # Step 2: _build_user_content handles only images (none left here)
     builder = _make_builder(tmp_path)
     result = builder._build_user_content(new_content, image_only if image_only else None)
 
+    # The document text should be present in the final content
     assert "Quarterly revenue" in result
     assert "summarize" in result
 
 
 def test_drain_pending_path_without_extract_loses_document(tmp_path: Path) -> None:
-    """Calling _build_user_content directly with a document drops the text."""
+    """Demonstrates the BUG: if _drain_pending calls _build_user_content
+    directly without extract_documents, document content is lost."""
     from docx import Document
 
     doc = Document()
@@ -91,7 +97,10 @@ def test_drain_pending_path_without_extract_loses_document(tmp_path: Path) -> No
     doc.save(docx_path)
 
     builder = _make_builder(tmp_path)
+
+    # Bug path: call _build_user_content directly with document media
     result = builder._build_user_content("summarize", [str(docx_path)])
 
-    assert result == "summarize"
+    # The document text is LOST — _build_user_content ignores non-images
+    assert result == "summarize"  # only the original text, no doc content
     assert "Secret data" not in result
