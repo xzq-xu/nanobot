@@ -54,15 +54,25 @@ _DEFAULT_OPENROUTER_HEADERS = {
 }
 _KIMI_THINKING_MODELS: frozenset[str] = frozenset({
     "kimi-k2.5",
+    "kimi-k2.6",
     "k2.6-code-preview",
 })
+
+# Maps ProviderSpec.thinking_style → extra_body builder.
+# Each builder takes a bool (thinking_enabled) and returns the dict to
+# merge into extra_body, keeping the style→wire-format mapping in one place.
+_THINKING_STYLE_MAP: dict[str, Any] = {
+    "thinking_type": lambda on: {"thinking": {"type": "enabled" if on else "disabled"}},
+    "enable_thinking": lambda on: {"enable_thinking": on},
+    "reasoning_split": lambda on: {"reasoning_split": on},
+}
 
 
 def _is_kimi_thinking_model(model_name: str) -> bool:
     """Return True if model_name refers to a Kimi thinking-capable model.
 
     Supports two forms:
-    - Exact match: kimi-k2.5 in _KIMI_THINKING_MODELS
+    - Exact match: e.g. kimi-k2.5 / kimi-k2.6 in _KIMI_THINKING_MODELS
     - Slug match:  moonshotai/kimi-k2.5 -> the part after the last "/"
                    is checked against _KIMI_THINKING_MODELS
 
@@ -386,24 +396,31 @@ class OpenAICompatProvider(LLMProvider):
                     kwargs.update(overrides)
                     break
 
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
+        # Normalize reasoning_effort into a semantic form (OpenAI vocab)
+        # used for internal decisions, and a wire form actually sent out.
+        # "minimum" is accepted as a DashScope-native alias for "minimal".
+        semantic_effort: str | None = None
+        if isinstance(reasoning_effort, str):
+            semantic_effort = reasoning_effort.lower()
+            if semantic_effort == "minimum":
+                semantic_effort = "minimal"
+
+        wire_effort = reasoning_effort
+        if spec and spec.name == "dashscope" and semantic_effort == "minimal":
+            # DashScope accepts none/minimum/low/medium/high/xhigh; "minimal" 400s.
+            wire_effort = "minimum"
+
+        if wire_effort:
+            kwargs["reasoning_effort"] = wire_effort
 
         # Provider-specific thinking parameters.
         # Only sent when reasoning_effort is explicitly configured so that
         # the provider default is preserved otherwise.
-        if spec and reasoning_effort is not None:
-            thinking_enabled = reasoning_effort.lower() != "minimal"
-            extra: dict[str, Any] | None = None
-            if spec.name == "dashscope":
-                extra = {"enable_thinking": thinking_enabled}
-            elif spec.name in (
-                "volcengine", "volcengine_coding_plan",
-                "byteplus", "byteplus_coding_plan",
-            ):
-                extra = {
-                    "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
-                }
+        # The mapping is driven by ProviderSpec.thinking_style so that adding
+        # a new provider never requires touching this function.
+        if spec and spec.thinking_style and reasoning_effort is not None:
+            thinking_enabled = semantic_effort != "minimal"
+            extra = _THINKING_STYLE_MAP.get(spec.thinking_style, lambda _: None)(thinking_enabled)
             if extra:
                 kwargs.setdefault("extra_body", {}).update(extra)
 
@@ -412,7 +429,7 @@ class OpenAICompatProvider(LLMProvider):
         # so that OpenRouter-style names like "moonshotai/kimi-k2.5" are handled
         # identically to bare names like "kimi-k2.5".
         if reasoning_effort is not None and _is_kimi_thinking_model(model_name):
-            thinking_enabled = reasoning_effort.lower() != "minimal"
+            thinking_enabled = semantic_effort != "minimal"
             kwargs.setdefault("extra_body", {}).update(
                 {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
             )
@@ -420,6 +437,26 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+
+        # Backfill reasoning_content on legacy assistant messages.
+        # DeepSeek V4 (and potentially others) rejects thinking-mode
+        # requests that contain assistant messages without reasoning_content
+        # — even on turns that had no tool calls. This happens when a
+        # session was started with a non-thinking model or without
+        # reasoning_effort, then the user switches thinking mode on
+        # mid-session. Injecting an empty string satisfies the API
+        # without altering semantics (the model treats it as "no
+        # thinking happened on that turn").
+        thinking_active = (
+            (spec and spec.thinking_style and reasoning_effort is not None
+             and semantic_effort != "minimal")
+            or (reasoning_effort is not None and _is_kimi_thinking_model(model_name)
+                and semantic_effort != "minimal")
+        )
+        if thinking_active:
+            for msg in kwargs["messages"]:
+                if msg.get("role") == "assistant" and "reasoning_content" not in msg:
+                    msg["reasoning_content"] = ""
 
         return kwargs
 
@@ -429,10 +466,11 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None,
     ) -> bool:
         """Use Responses API only for direct OpenAI requests that benefit from it."""
-        if self._spec and self._spec.name != "openai":
+        if self._spec and self._spec.name not in ("openai", "github_copilot"):
             return False
-        if not _is_direct_openai_base(self._effective_base):
-            return False
+        if self._spec is None or self._spec.name != "github_copilot":
+            if not _is_direct_openai_base(self._effective_base):
+                return False
 
         model_name = (model or self.default_model).lower()
         wants = False
@@ -510,6 +548,8 @@ class OpenAICompatProvider(LLMProvider):
     ) -> dict[str, Any]:
         """Build a Responses API body for direct OpenAI requests."""
         model_name = model or self.default_model
+        if self._spec and self._spec.strip_model_prefix:
+            model_name = model_name.split("/")[-1]
         sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
         instructions, input_items = convert_messages(sanitized_messages)
 
@@ -970,6 +1010,11 @@ class OpenAICompatProvider(LLMProvider):
                     self._record_responses_success(model, reasoning_effort)
                     return result
                 except Exception as responses_error:
+                    if self._spec and self._spec.name == "github_copilot":
+                        # Copilot gateway exposes GPT-5/o-series only via /responses;
+                        # falling back to /chat/completions cannot succeed and would
+                        # hide the real error.
+                        raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
                     self._record_responses_failure(model, reasoning_effort)
@@ -1028,6 +1073,11 @@ class OpenAICompatProvider(LLMProvider):
                         reasoning_content=reasoning_content,
                     )
                 except Exception as responses_error:
+                    if self._spec and self._spec.name == "github_copilot":
+                        # Copilot gateway exposes GPT-5/o-series only via /responses;
+                        # falling back to /chat/completions cannot succeed and would
+                        # hide the real error.
+                        raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
                     self._record_responses_failure(model, reasoning_effort)

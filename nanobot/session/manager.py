@@ -11,7 +11,12 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
-from nanobot.utils.helpers import ensure_dir, find_legal_message_start, safe_filename
+from nanobot.utils.helpers import (
+    ensure_dir,
+    find_legal_message_start,
+    image_placeholder_text,
+    safe_filename,
+)
 
 
 @dataclass
@@ -54,7 +59,19 @@ class Session:
 
         out: list[dict[str, Any]] = []
         for message in sliced:
-            entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
+            content = message.get("content", "")
+            # Synthesize an ``[image: path]`` breadcrumb from the persisted
+            # ``media`` kwarg so LLM replay still sees *something* where the
+            # image used to be. Without this, an image-only user turn
+            # replays as an empty user message — the assistant's reply then
+            # looks like it's responding to nothing.
+            media = message.get("media")
+            if isinstance(media, list) and media and isinstance(content, str):
+                breadcrumbs = "\n".join(
+                    image_placeholder_text(p) for p in media if isinstance(p, str) and p
+                )
+                content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
+            entry: dict[str, Any] = {"role": message["role"], "content": content}
             for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
                 if key in message:
                     entry[key] = message[key]
@@ -262,8 +279,16 @@ class SessionManager:
             "messages": session.messages,
         }
 
-    def save(self, session: Session) -> None:
-        """Save a session to disk atomically."""
+    def save(self, session: Session, *, fsync: bool = False) -> None:
+        """Save a session to disk atomically.
+
+        When *fsync* is ``True`` the final file and its parent directory are
+        explicitly flushed to durable storage.  This is intentionally off by
+        default (the OS page-cache is sufficient for normal operation) but
+        should be enabled during graceful shutdown so that filesystems with
+        write-back caching (e.g. rclone VFS, NFS, FUSE mounts) do not lose
+        the most recent writes.
+        """
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
 
@@ -280,13 +305,46 @@ class SessionManager:
                 f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
                 for msg in session.messages:
                     f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                if fsync:
+                    f.flush()
+                    os.fsync(f.fileno())
 
             os.replace(tmp_path, path)
+
+            if fsync:
+                # fsync the directory so the rename is durable.
+                # On Windows, opening a directory with O_RDONLY raises
+                # PermissionError — skip the dir sync there (NTFS
+                # journals metadata synchronously).
+                try:
+                    fd = os.open(str(path.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                except PermissionError:
+                    pass  # Windows — directory fsync not supported
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
 
         self._cache[session.key] = session
+
+    def flush_all(self) -> int:
+        """Re-save every cached session with fsync for durable shutdown.
+
+        Returns the number of sessions flushed.  Errors on individual
+        sessions are logged but do not prevent other sessions from being
+        flushed.
+        """
+        flushed = 0
+        for key, session in list(self._cache.items()):
+            try:
+                self.save(session, fsync=True)
+                flushed += 1
+            except Exception:
+                logger.warning("Failed to flush session {}", key, exc_info=True)
+        return flushed
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
