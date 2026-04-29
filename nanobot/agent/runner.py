@@ -78,6 +78,7 @@ class AgentRunSpec:
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
+    terminal_tool_names: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -381,6 +382,22 @@ class AgentRunner:
                         "pending_tool_calls": [],
                     },
                 )
+                terminal_tool_index = next(
+                    (
+                        idx
+                        for idx, tc in enumerate(tool_calls)
+                        if tc.name in spec.terminal_tool_names
+                    ),
+                    None,
+                )
+                if terminal_tool_index is not None:
+                    final_content = str(results[terminal_tool_index] or "").strip()
+                    stop_reason = "terminal_tool"
+                    self._append_final_message(messages, final_content)
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    break
                 empty_content_retries = 0
                 length_recovery_count = 0
                 # Checkpoint 1: drain injections after tools, before next LLM call

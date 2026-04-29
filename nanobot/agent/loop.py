@@ -595,6 +595,7 @@ class AgentLoop:
             retry_wait_callback=on_retry_wait,
             checkpoint_callback=_checkpoint,
             injection_callback=_drain_pending,
+            terminal_tool_names=set(getattr(self.runner, "_terminal_tool_names", set())),
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
