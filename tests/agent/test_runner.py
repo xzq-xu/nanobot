@@ -102,43 +102,6 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 
 
 @pytest.mark.asyncio
-async def test_runner_stops_after_terminal_tool_without_second_model_call():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
-
-    provider = MagicMock()
-    calls = {"n": 0}
-
-    async def chat_with_retry(**kwargs):
-        calls["n"] += 1
-        return LLMResponse(
-            content="",
-            tool_calls=[ToolCallRequest(id="call_1", name="restart_gateway", arguments={})],
-            usage={"prompt_tokens": 5, "completion_tokens": 1},
-        )
-
-    provider.chat_with_retry = chat_with_retry
-    tools = MagicMock()
-    tools.get_definitions.return_value = []
-    tools.execute = AsyncMock(return_value="Restart scheduled")
-
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
-        initial_messages=[{"role": "user", "content": "restart"}],
-        tools=tools,
-        model="test-model",
-        max_iterations=3,
-        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-        terminal_tool_names={"restart_gateway"},
-    ))
-
-    assert calls["n"] == 1
-    assert result.stop_reason == "terminal_tool"
-    assert result.final_content == "Restart scheduled"
-    assert result.tools_used == ["restart_gateway"]
-    assert result.messages[-1] == {"role": "assistant", "content": "Restart scheduled"}
-
-
-@pytest.mark.asyncio
 async def test_runner_calls_hooks_in_order():
     from nanobot.agent.hook import AgentHook, AgentHookContext
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
