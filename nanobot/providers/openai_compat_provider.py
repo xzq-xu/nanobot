@@ -98,6 +98,20 @@ def _is_deepseek_default_thinking_model(model_name: str) -> bool:
     return slug.startswith("deepseek-v4") or slug == "deepseek-reasoner"
 
 
+def _looks_like_deepseek_api_base(api_base: str | None) -> bool:
+    if not api_base:
+        return False
+    try:
+        host = urlparse(api_base if "://" in api_base else f"//{api_base}").hostname
+    except ValueError:
+        return False
+    return bool(host and "deepseek" in host.lower())
+
+
+def _looks_like_deepseek_model(model_name: str) -> bool:
+    return "deepseek" in model_name.lower()
+
+
 def _openai_compat_timeout_s() -> float:
     """Return the bounded request timeout used for OpenAI-compatible providers."""
     return _float_env("NANOBOT_OPENAI_COMPAT_TIMEOUT_S", _OPENAI_COMPAT_REQUEST_TIMEOUT_S)
@@ -411,11 +425,15 @@ class OpenAICompatProvider(LLMProvider):
             dumped = str(content)
         return dumped or "(empty)"
 
-    def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _sanitize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        model_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Strip non-standard keys, normalize tool_call IDs."""
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
-        force_string_content = bool(self._spec and self._spec.name == "deepseek")
+        force_string_content = self._is_deepseek_request(model_name or self.default_model)
 
         def map_id(value: Any) -> Any:
             if not isinstance(value, str):
@@ -463,8 +481,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None,
     ) -> list[dict[str, Any]]:
         if (
-            not self._spec
-            or self._spec.name != "deepseek"
+            not self._is_deepseek_request(model_name)
             or not self._is_deepseek_thinking_active(model_name, reasoning_effort)
         ):
             return messages
@@ -496,6 +513,14 @@ class OpenAICompatProvider(LLMProvider):
             len(messages) - len(trimmed),
         )
         return trimmed
+
+    def _is_deepseek_request(self, model_name: str) -> bool:
+        if self._spec and self._spec.name == "deepseek":
+            return True
+        return (
+            _looks_like_deepseek_model(model_name)
+            or _looks_like_deepseek_api_base(self.api_base)
+        )
 
     @staticmethod
     def _is_deepseek_thinking_active(
@@ -558,7 +583,10 @@ class OpenAICompatProvider(LLMProvider):
         )
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages),
+                model_name=model_name,
+            ),
         }
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when
@@ -605,6 +633,11 @@ class OpenAICompatProvider(LLMProvider):
             extra = _THINKING_STYLE_MAP.get(spec.thinking_style, lambda _: None)(thinking_enabled)
             if extra:
                 kwargs.setdefault("extra_body", {}).update(extra)
+        elif self._is_deepseek_request(model_name) and reasoning_effort is not None:
+            thinking_enabled = semantic_effort not in ("none", "minimal")
+            kwargs.setdefault("extra_body", {}).update(
+                {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
+            )
 
         # Model-level thinking injection for Kimi thinking-capable models.
         # Strip any provider prefix (e.g. "moonshotai/") before the set lookup
@@ -632,7 +665,7 @@ class OpenAICompatProvider(LLMProvider):
         thinking_active = (
             (spec and spec.thinking_style and reasoning_effort is not None
              and semantic_effort not in ("none", "minimal"))
-            or (spec and spec.name == "deepseek"
+            or (self._is_deepseek_request(model_name)
                 and self._is_deepseek_thinking_active(model_name, reasoning_effort))
             or (reasoning_effort is not None and _is_kimi_thinking_model(model_name)
                 and semantic_effort not in ("none", "minimal"))

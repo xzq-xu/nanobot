@@ -964,6 +964,65 @@ def test_deepseek_v4_drops_legacy_tool_history_without_reasoning_effort() -> Non
     ]
 
 
+def test_custom_deepseek_v4_drops_legacy_tool_history_without_reasoning_effort() -> None:
+    """Custom configs pointing at DeepSeek must still use DeepSeek history rules."""
+    spec = find_by_name("custom")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        p = OpenAICompatProvider(
+            api_key="k",
+            api_base="https://api.deepseek.com",
+            default_model="deepseek-v4-pro",
+            spec=spec,
+        )
+
+    kw = p._build_kwargs(
+        messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "use another model first"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "tc1", "type": "function", "function": {"name": "web_fetch", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc1", "content": "result"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "continue after switching to DeepSeek"},
+        ],
+        tools=None,
+        model="deepseek-v4-pro",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+
+    assert kw["messages"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "continue after switching to DeepSeek"},
+    ]
+
+
+def test_custom_deepseek_injects_thinking_extra_body() -> None:
+    spec = find_by_name("custom")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        p = OpenAICompatProvider(
+            api_key="k",
+            api_base="https://api.deepseek.com",
+            default_model="deepseek-v4-pro",
+            spec=spec,
+        )
+
+    kw = p._build_kwargs(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        model="deepseek-v4-pro",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort="high",
+        tool_choice=None,
+    )
+
+    assert kw["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
 def test_deepseek_coerces_list_content_to_string() -> None:
     """DeepSeek chat endpoint expects message.content to be a string."""
     spec = find_by_name("deepseek")
