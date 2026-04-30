@@ -121,6 +121,14 @@ def test_openrouter_spec_is_gateway() -> None:
     assert spec.default_api_base == "https://openrouter.ai/api/v1"
 
 
+def test_gemma_routes_to_gemini_provider() -> None:
+    """gemma models (e.g. gemma-3-27b-it) must auto-route to Gemini when GEMINI_API_KEY is set.
+    Users running gemma via the Gemini API endpoint expect automatic provider detection."""
+    spec = find_by_name("gemini")
+    assert spec is not None
+    assert "gemma" in spec.keywords
+
+
 def test_openrouter_sets_default_attribution_headers() -> None:
     spec = find_by_name("openrouter")
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
@@ -926,6 +934,57 @@ def test_backfill_does_not_touch_messages_when_thinking_off() -> None:
                 assert "reasoning_content" not in msg
 
 
+def test_deepseek_coerces_list_content_to_string() -> None:
+    """DeepSeek chat endpoint expects message.content to be a string."""
+    spec = find_by_name("deepseek")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        p = OpenAICompatProvider(api_key="k", default_model="deepseek-chat", spec=spec)
+
+    kw = p._build_kwargs(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+        }],
+        tools=None,
+        model="deepseek-chat",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+
+    assert isinstance(kw["messages"][0]["content"], str)
+    assert "hello" in kw["messages"][0]["content"]
+    assert "world" in kw["messages"][0]["content"]
+
+
+def test_non_deepseek_keeps_list_content() -> None:
+    """Only DeepSeek should force string content; OpenAI-compatible providers keep blocks."""
+    spec = find_by_name("openai")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        p = OpenAICompatProvider(api_key="k", default_model="gpt-4o", spec=spec)
+
+    kw = p._build_kwargs(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+            ],
+        }],
+        tools=None,
+        model="gpt-4o",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+
+    assert isinstance(kw["messages"][0]["content"], list)
+
+
 def test_openai_no_thinking_extra_body() -> None:
     """Non-thinking providers should never get extra_body for thinking."""
     kw = _build_kwargs_for("openai", "gpt-4o", reasoning_effort="medium")
@@ -996,3 +1055,46 @@ def test_kimi_k2_thinking_series_no_thinking_injection() -> None:
     """kimi-k2-thinking series models must NOT receive extra_body.thinking."""
     kw = _build_kwargs_for("moonshot", "kimi-k2-thinking", reasoning_effort="high")
     assert "extra_body" not in kw
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort="none" — treated as thinking disabled 
+# ---------------------------------------------------------------------------
+
+def test_deepseek_thinking_disabled_for_none_string() -> None:
+    """reasoning_effort='none' must send thinking.type=disabled and skip reasoning_effort field."""
+    kw = _build_kwargs_for("deepseek", "deepseek-v4-pro", reasoning_effort="none")
+    assert kw.get("extra_body") == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in kw
+
+
+def test_kimi_k25_thinking_disabled_for_none_string() -> None:
+    """reasoning_effort='none' maps to thinking disabled for kimi-k2.5."""
+    kw = _build_kwargs_for("moonshot", "kimi-k2.5", reasoning_effort="none")
+    assert kw.get("extra_body") == {"thinking": {"type": "disabled"}}
+
+
+def test_dashscope_thinking_disabled_for_none_string() -> None:
+    """reasoning_effort='none' disables thinking and must not emit reasoning_effort on DashScope."""
+    kw = _build_kwargs_for("dashscope", "qwen3.6-plus", reasoning_effort="none")
+    assert kw.get("extra_body") == {"enable_thinking": False}
+    assert "reasoning_effort" not in kw
+
+
+def test_deepseek_no_backfill_when_reasoning_effort_none_string() -> None:
+    """reasoning_effort='none' must NOT trigger reasoning_content backfill (thinking inactive)."""
+    spec = find_by_name("deepseek")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        p = OpenAICompatProvider(api_key="k", default_model="deepseek-v4-pro", spec=spec)
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "continue"},
+    ]
+    kw = p._build_kwargs(
+        messages=list(messages), tools=None, model="deepseek-v4-pro",
+        max_tokens=1024, temperature=0.7,
+        reasoning_effort="none", tool_choice=None,
+    )
+    assistant = kw["messages"][1]
+    assert "reasoning_content" not in assistant
