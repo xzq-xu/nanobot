@@ -91,6 +91,13 @@ def _is_kimi_thinking_model(model_name: str) -> bool:
     return False
 
 
+def _is_deepseek_default_thinking_model(model_name: str) -> bool:
+    """Return True for DeepSeek models whose API may enable thinking by model."""
+    name = model_name.lower()
+    slug = name.rsplit("/", 1)[-1]
+    return slug.startswith("deepseek-v4") or slug == "deepseek-reasoner"
+
+
 def _openai_compat_timeout_s() -> float:
     """Return the bounded request timeout used for OpenAI-compatible providers."""
     return _float_env("NANOBOT_OPENAI_COMPAT_TIMEOUT_S", _OPENAI_COMPAT_REQUEST_TIMEOUT_S)
@@ -452,13 +459,13 @@ class OpenAICompatProvider(LLMProvider):
     def _drop_deepseek_incomplete_reasoning_history(
         self,
         messages: list[dict[str, Any]],
+        model_name: str,
         reasoning_effort: str | None,
     ) -> list[dict[str, Any]]:
         if (
             not self._spec
             or self._spec.name != "deepseek"
-            or not reasoning_effort
-            or reasoning_effort.lower() == "none"
+            or not self._is_deepseek_thinking_active(model_name, reasoning_effort)
         ):
             return messages
 
@@ -489,6 +496,20 @@ class OpenAICompatProvider(LLMProvider):
             len(messages) - len(trimmed),
         )
         return trimmed
+
+    @staticmethod
+    def _is_deepseek_thinking_active(
+        model_name: str,
+        reasoning_effort: str | None,
+    ) -> bool:
+        semantic_effort = reasoning_effort.lower() if isinstance(reasoning_effort, str) else None
+        if semantic_effort == "minimum":
+            semantic_effort = "minimal"
+        if semantic_effort in ("none", "minimal"):
+            return False
+        if semantic_effort is not None:
+            return True
+        return _is_deepseek_default_thinking_model(model_name)
 
     # ------------------------------------------------------------------
     # Build kwargs
@@ -532,6 +553,7 @@ class OpenAICompatProvider(LLMProvider):
 
         messages = self._drop_deepseek_incomplete_reasoning_history(
             messages,
+            model_name,
             reasoning_effort,
         )
         kwargs: dict[str, Any] = {
@@ -610,6 +632,8 @@ class OpenAICompatProvider(LLMProvider):
         thinking_active = (
             (spec and spec.thinking_style and reasoning_effort is not None
              and semantic_effort not in ("none", "minimal"))
+            or (spec and spec.name == "deepseek"
+                and self._is_deepseek_thinking_active(model_name, reasoning_effort))
             or (reasoning_effort is not None and _is_kimi_thinking_model(model_name)
                 and semantic_effort not in ("none", "minimal"))
         )

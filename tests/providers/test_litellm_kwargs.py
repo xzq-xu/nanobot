@@ -911,7 +911,7 @@ def test_deepseek_backfills_reasoning_content_on_legacy_tool_call_messages() -> 
 
 
 def test_backfill_does_not_touch_messages_when_thinking_off() -> None:
-    """When reasoning_effort is None or minimal, legacy messages must NOT be altered."""
+    """When thinking is off, legacy messages must NOT be altered."""
     spec = find_by_name("deepseek")
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         p = OpenAICompatProvider(api_key="k", default_model="deepseek-v4-pro", spec=spec)
@@ -923,15 +923,45 @@ def test_backfill_does_not_touch_messages_when_thinking_off() -> None:
         {"role": "tool", "tool_call_id": "tc1", "content": "result"},
         {"role": "user", "content": "thanks"},
     ]
-    for effort in (None, "minimal"):
-        kw = p._build_kwargs(
-            messages=list(messages), tools=None, model="deepseek-v4-pro",
-            max_tokens=1024, temperature=0.7,
-            reasoning_effort=effort, tool_choice=None,
-        )
-        for msg in kw["messages"]:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                assert "reasoning_content" not in msg
+    kw = p._build_kwargs(
+        messages=list(messages), tools=None, model="deepseek-v4-pro",
+        max_tokens=1024, temperature=0.7,
+        reasoning_effort="minimal", tool_choice=None,
+    )
+    for msg in kw["messages"]:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            assert "reasoning_content" not in msg
+
+
+def test_deepseek_v4_drops_legacy_tool_history_without_reasoning_effort() -> None:
+    """DeepSeek V4 can be in thinking mode even without explicit reasoning_effort."""
+    spec = find_by_name("deepseek")
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        p = OpenAICompatProvider(api_key="k", default_model="deepseek-v4-pro", spec=spec)
+
+    kw = p._build_kwargs(
+        messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "use another model first"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "tc1", "type": "function", "function": {"name": "web_fetch", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc1", "content": "result"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "continue after switching to DeepSeek"},
+        ],
+        tools=None,
+        model="deepseek-v4-pro",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+
+    assert kw["messages"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "continue after switching to DeepSeek"},
+    ]
 
 
 def test_deepseek_coerces_list_content_to_string() -> None:
