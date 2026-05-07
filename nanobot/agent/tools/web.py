@@ -388,6 +388,7 @@ class WebFetchTool(Tool):
         max_chars: int | None = None,
         **kwargs: Any,
     ) -> Any:
+        url = url.strip(" \t\r\n`\"'")
         extract_mode = kwargs.pop("extractMode", extract_mode)
         max_chars = kwargs.pop("maxChars", max_chars) or self.max_chars
         is_valid, error_msg = _validate_url_safe(url)
@@ -499,10 +500,10 @@ class WebFetchTool(Tool):
                 "untrusted": True, "text": text,
             }, ensure_ascii=False)
         except httpx.ProxyError as e:
-            logger.error("WebFetch proxy error for {}: {}", url, e)
+            logger.exception("WebFetch proxy error for {}", url)
             return json.dumps({"error": f"Proxy error: {e}", "url": url}, ensure_ascii=False)
         except Exception as e:
-            logger.error("WebFetch error for {}: {}", url, e)
+            logger.exception("WebFetch error for {}", url)
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
 
     def _to_markdown(self, html_content: str) -> str:

@@ -1,4 +1,4 @@
-from nanobot.session.manager import Session
+from nanobot.session.manager import Session, SessionManager
 
 
 def _assert_no_orphans(history: list[dict]) -> None:
@@ -29,6 +29,18 @@ def _tool_turn(prefix: str, idx: int) -> list[dict]:
         {"role": "tool", "tool_call_id": f"{prefix}_{idx}_a", "name": "x", "content": "ok"},
         {"role": "tool", "tool_call_id": f"{prefix}_{idx}_b", "name": "y", "content": "ok"},
     ]
+
+
+def test_list_sessions_includes_metadata_title(tmp_path):
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:chat-title")
+    session.metadata["title"] = "自动生成标题"
+    manager.save(session)
+
+    rows = manager.list_sessions()
+
+    assert rows[0]["key"] == "websocket:chat-title"
+    assert rows[0]["title"] == "自动生成标题"
 
 
 # --- Original regression test (from PR 2075) ---
@@ -180,6 +192,7 @@ def test_get_history_preserves_reasoning_content():
         "role": "assistant",
         "content": "done",
         "reasoning_content": "hidden chain of thought",
+        "thinking_blocks": [{"type": "thinking", "thinking": "hidden chain of thought", "signature": "sig"}],
     })
 
     history = session.get_history(max_messages=500)
@@ -190,6 +203,11 @@ def test_get_history_preserves_reasoning_content():
             "role": "assistant",
             "content": "done",
             "reasoning_content": "hidden chain of thought",
+            "thinking_blocks": [{
+                "type": "thinking",
+                "thinking": "hidden chain of thought",
+                "signature": "sig",
+            }],
         },
     ]
 

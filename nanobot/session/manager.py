@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -118,7 +119,7 @@ class Session:
             if include_timestamps:
                 content = self._annotate_message_time(message, content)
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
+            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)
@@ -362,15 +363,11 @@ class SessionManager:
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
                         if data.get("created_at"):
-                            try:
+                            with suppress(ValueError, TypeError):
                                 created_at = datetime.fromisoformat(data["created_at"])
-                            except (ValueError, TypeError):
-                                pass
                         if data.get("updated_at"):
-                            try:
+                            with suppress(ValueError, TypeError):
                                 updated_at = datetime.fromisoformat(data["updated_at"])
-                            except (ValueError, TypeError):
-                                pass
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
@@ -440,14 +437,12 @@ class SessionManager:
                 # On Windows, opening a directory with O_RDONLY raises
                 # PermissionError — skip the dir sync there (NTFS
                 # journals metadata synchronously).
-                try:
+                with suppress(PermissionError):
                     fd = os.open(str(path.parent), os.O_RDONLY)
                     try:
                         os.fsync(fd)
                     finally:
                         os.close(fd)
-                except PermissionError:
-                    pass  # Windows — directory fsync not supported
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
@@ -552,10 +547,13 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
+                            metadata = data.get("metadata", {})
+                            title = metadata.get("title") if isinstance(metadata, dict) else None
                             sessions.append({
                                 "key": key,
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
+                                "title": title if isinstance(title, str) else "",
                                 "path": str(path)
                             })
             except Exception:
@@ -565,6 +563,11 @@ class SessionManager:
                         "key": repaired.key,
                         "created_at": repaired.created_at.isoformat(),
                         "updated_at": repaired.updated_at.isoformat(),
+                        "title": (
+                            repaired.metadata.get("title")
+                            if isinstance(repaired.metadata.get("title"), str)
+                            else ""
+                        ),
                         "path": str(path)
                     })
                 continue

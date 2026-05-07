@@ -5,7 +5,8 @@ import os
 import select
 import signal
 import sys
-from contextlib import nullcontext
+from collections.abc import Callable
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +15,28 @@ if sys.platform == "win32":
     if sys.stdout.encoding != "utf-8":
         os.environ["PYTHONIOENCODING"] = "utf-8"
         # Re-open stdout/stderr with UTF-8 encoding
-        try:
+        with suppress(Exception):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
 
 import typer
 from loguru import logger
+
+# Remove default handler and re-add with unified nanobot format
+logger.remove()
+_log_handler_id = logger.add(
+    sys.stderr,
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <5}</level> | "
+        "<cyan>{extra[channel]}</cyan> | "
+        "<level>{message}</level>"
+    ),
+    level="INFO",
+    colorize=None,
+    filter=lambda record: record["extra"].setdefault("channel", "-") or True,
+)
+
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
@@ -83,35 +98,29 @@ def _flush_pending_tty_input() -> None:
     except Exception:
         return
 
-    try:
+    with suppress(Exception):
         import termios
 
         termios.tcflush(fd, termios.TCIFLUSH)
         return
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         while True:
             ready, _, _ = select.select([fd], [], [], 0)
             if not ready:
                 break
             if not os.read(fd, 4096):
                 break
-    except Exception:
-        return
 
 
 def _restore_terminal() -> None:
     """Restore terminal to its original state (echo, line buffering, etc.)."""
     if _SAVED_TERM_ATTRS is None:
         return
-    try:
+    with suppress(Exception):
         import termios
 
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
-    except Exception:
-        pass
 
 
 def _init_prompt_session() -> None:
@@ -119,12 +128,10 @@ def _init_prompt_session() -> None:
     global _PROMPT_SESSION, _SAVED_TERM_ATTRS
 
     # Save terminal state so we can restore it on exit
-    try:
+    with suppress(Exception):
         import termios
 
         _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
-    except Exception:
-        pass
 
     from nanobot.config.paths import get_cli_history_path
 
@@ -224,6 +231,29 @@ async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner 
         return
     with thinking.pause() if thinking else nullcontext():
         await _print_interactive_line(text)
+
+
+async def _maybe_print_interactive_progress(
+    msg: Any,
+    thinking: ThinkingSpinner | None,
+    channels_config: Any,
+) -> bool:
+    metadata = msg.metadata or {}
+    if metadata.get("_retry_wait"):
+        await _print_interactive_progress_line(msg.content, thinking)
+        return True
+
+    if not metadata.get("_progress"):
+        return False
+
+    is_tool_hint = metadata.get("_tool_hint", False)
+    if channels_config and is_tool_hint and not channels_config.send_tool_hints:
+        return True
+    if channels_config and not is_tool_hint and not channels_config.send_progress:
+        return True
+
+    await _print_interactive_progress_line(msg.content, thinking)
+    return True
 
 
 def _is_exit_command(command: str) -> bool:
@@ -527,6 +557,7 @@ def serve(
         context_block_limit=runtime_config.agents.defaults.context_block_limit,
         max_tool_result_chars=runtime_config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=runtime_config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=runtime_config.agents.defaults.tool_hint_max_length,
         web_config=runtime_config.tools.web,
         exec_config=runtime_config.tools.exec,
         restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
@@ -583,9 +614,19 @@ def gateway(
 ):
     """Start the nanobot gateway."""
     if verbose:
-        import logging
-
-        logging.basicConfig(level=logging.DEBUG)
+        logger.remove(_log_handler_id)
+        logger.add(
+            sys.stderr,
+            format=(
+                "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+                "<level>{level: <5}</level> | "
+                "<cyan>{extra[channel]}</cyan> | "
+                "<level>{message}</level>"
+            ),
+            level="DEBUG",
+            colorize=None,
+            filter=lambda record: record["extra"].setdefault("channel", "-") or True,
+        )
     cfg = _load_runtime_config(config, workspace)
     _run_gateway(cfg, port=port)
 
@@ -641,6 +682,7 @@ def _run_gateway(
         context_block_limit=config.agents.defaults.context_block_limit,
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=config.agents.defaults.tool_hint_max_length,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -936,10 +978,8 @@ def _run_gateway(
                     config.gateway.host or "127.0.0.1", port
                 )
                 writer.close()
-                try:
+                with suppress(Exception):
                     await writer.wait_closed()
-                except Exception:
-                    pass
                 break
             except OSError:
                 await asyncio.sleep(0.1)
@@ -1035,6 +1075,7 @@ def agent(
         context_block_limit=config.agents.defaults.context_block_limit,
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=config.agents.defaults.tool_hint_max_length,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -1139,15 +1180,11 @@ def agent(
                             turn_done.set()
                             continue
 
-                        if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
-                                await _print_interactive_progress_line(msg.content, _thinking)
+                        if await _maybe_print_interactive_progress(
+                            msg,
+                            _thinking,
+                            agent_loop.channels_config,
+                        ):
                             continue
 
                         if not turn_done.is_set():
@@ -1480,10 +1517,17 @@ provider_app = typer.Typer(help="Manage providers")
 app.add_typer(provider_app, name="provider")
 
 
-_LOGIN_HANDLERS: dict[str, callable] = {}
+_LOGIN_HANDLERS: dict[str, Callable[[], None]] = {}
+_LOGOUT_HANDLERS: dict[str, Callable[[], None]] = {}
+
+_PROVIDER_DISPLAY: dict[str, str] = {
+    "openai_codex": "OpenAI Codex",
+    "github_copilot": "GitHub Copilot",
+}
 
 
 def _register_login(name: str):
+    """Register an OAuth login handler."""
     def decorator(fn):
         _LOGIN_HANDLERS[name] = fn
         return fn
@@ -1491,11 +1535,16 @@ def _register_login(name: str):
     return decorator
 
 
-@provider_app.command("login")
-def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
-):
-    """Authenticate with an OAuth provider."""
+def _register_logout(name: str):
+    """Register an OAuth logout handler."""
+    def decorator(fn):
+        _LOGOUT_HANDLERS[name] = fn
+        return fn
+    return decorator
+
+
+def _resolve_oauth_provider(provider: str):
+    """Resolve and validate an OAuth provider configuration."""
     from nanobot.providers.registry import PROVIDERS
 
     key = provider.replace("-", "_")
@@ -1504,6 +1553,15 @@ def provider_login(
         names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
         console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
         raise typer.Exit(1)
+    return spec
+
+
+@provider_app.command("login")
+def provider_login(
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+):
+    """Authenticate with an OAuth provider."""
+    spec = _resolve_oauth_provider(provider)
 
     handler = _LOGIN_HANDLERS.get(spec.name)
     if not handler:
@@ -1514,16 +1572,30 @@ def provider_login(
     handler()
 
 
+@provider_app.command("logout")
+def provider_logout(
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+):
+    """Log out from an OAuth provider."""
+    spec = _resolve_oauth_provider(provider)
+
+    handler = _LOGOUT_HANDLERS.get(spec.name)
+    if not handler:
+        console.print(f"[red]Logout not implemented for {spec.label}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} OAuth Logout - {spec.label}\n")
+    handler()
+
+
 @_register_login("openai_codex")
 def _login_openai_codex() -> None:
     try:
         from oauth_cli_kit import get_token, login_oauth_interactive
 
         token = None
-        try:
+        with suppress(Exception):
             token = get_token()
-        except Exception:
-            pass
         if not (token and token.access):
             console.print("[cyan]Starting interactive OAuth login...[/cyan]\n")
             token = login_oauth_interactive(
@@ -1537,6 +1609,59 @@ def _login_openai_codex() -> None:
     except ImportError:
         console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
         raise typer.Exit(1)
+
+
+@_register_logout("openai_codex")
+def _logout_openai_codex() -> None:
+    """Clear local OAuth credentials for OpenAI Codex."""
+    try:
+        from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER
+        from oauth_cli_kit.storage import FileTokenStorage
+    except ImportError:
+        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+        raise typer.Exit(1)
+
+    storage = FileTokenStorage(token_filename=OPENAI_CODEX_PROVIDER.token_filename)
+    _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["openai_codex"])
+
+
+@_register_logout("github_copilot")
+def _logout_github_copilot() -> None:
+    """Clear local OAuth credentials for GitHub Copilot."""
+    try:
+        from nanobot.providers.github_copilot_provider import get_storage
+    except ImportError:
+        console.print("[red]GitHub Copilot provider unavailable. Ensure oauth-cli-kit is installed.[/red]")
+        raise typer.Exit(1)
+
+    storage = get_storage()
+    _delete_oauth_files(storage.get_token_path(), _PROVIDER_DISPLAY["github_copilot"])
+
+
+def _delete_oauth_files(token_path: Path, provider_label: str) -> None:
+    """Delete OAuth token and lock files, reporting the result."""
+    removed_paths: list[Path] = []
+    skipped: list[tuple[Path, OSError]] = []
+    for path in (token_path, token_path.with_suffix(".lock")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            skipped.append((path, exc))
+            continue
+        removed_paths.append(path)
+
+    if not removed_paths and not skipped:
+        console.print(f"[yellow]! No local OAuth credentials found for {provider_label}[/yellow]")
+        return
+
+    if removed_paths:
+        console.print(f"[green]✓ Logged out from {provider_label}[/green]")
+        for path in removed_paths:
+            console.print(f"[dim]Removed: {path}[/dim]")
+    for path, exc in skipped:
+        console.print(f"[yellow]! Could not remove {path}: {exc}[/yellow]")
 
 
 @_register_login("github_copilot")

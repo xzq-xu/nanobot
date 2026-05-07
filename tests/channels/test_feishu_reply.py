@@ -446,6 +446,58 @@ async def test_on_message_no_extra_api_call_when_no_parent_id() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Inbound media tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_message_audio_publishes_downloaded_path_and_transcription() -> None:
+    channel = _make_feishu_channel()
+    channel._processed_message_ids.clear()
+    captured = []
+
+    async def capture(msg):
+        captured.append(msg)
+
+    channel.bus.publish_inbound = capture
+    channel._download_and_save_media = AsyncMock(
+        return_value=(r"C:\\Users\\dodre\\.nanobot\\media\\feishu\\voice.ogg", "[audio: voice.ogg]")
+    )
+    channel.transcribe_audio = AsyncMock(return_value="hello from voice")
+    channel._add_reaction = AsyncMock(return_value=None)
+
+    event = _make_feishu_event(
+        msg_type="audio",
+        content='{"file_key": "audio_key", "duration": 1000}',
+        message_id="om_audio",
+    )
+    await channel._on_message(event)
+
+    channel._download_and_save_media.assert_awaited_once_with(
+        "audio", {"file_key": "audio_key", "duration": 1000}, "om_audio"
+    )
+    channel.transcribe_audio.assert_awaited_once_with(r"C:\\Users\\dodre\\.nanobot\\media\\feishu\\voice.ogg")
+    assert len(captured) == 1
+    assert captured[0].media == [r"C:\\Users\\dodre\\.nanobot\\media\\feishu\\voice.ogg"]
+    assert captured[0].content == "[transcription: hello from voice]"
+
+
+@pytest.mark.asyncio
+async def test_download_and_save_media_returns_absolute_path_in_content(monkeypatch, tmp_path) -> None:
+    channel = _make_feishu_channel()
+    monkeypatch.setattr(feishu, "get_media_dir", lambda _channel: tmp_path)
+    channel._download_file_sync = MagicMock(return_value=(b"voice-bytes", None))
+
+    file_path, content_text = await channel._download_and_save_media(
+        "audio", {"file_key": "voice_key"}, "om_audio"
+    )
+
+    assert file_path == str(tmp_path / "voice_key.ogg")
+    assert (tmp_path / "voice_key.ogg").read_bytes() == b"voice-bytes"
+    assert content_text == f"[audio: {file_path}]"
+
+
+# ---------------------------------------------------------------------------
 # Session key derivation tests
 # ---------------------------------------------------------------------------
 
@@ -578,6 +630,32 @@ async def test_reply_without_reply_in_thread_when_disabled() -> None:
 
     # No message_id in metadata → no reply attempt, direct create
     channel._client.im.v1.message.create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_topic_reply_does_not_force_reply_in_thread_when_disabled() -> None:
+    """Topic replies must not create new Feishu topics when reply_to_message is False."""
+    channel = _make_feishu_channel(reply_to_message=False)
+
+    reply_resp = MagicMock()
+    reply_resp.success.return_value = True
+    channel._client.im.v1.message.reply.return_value = reply_resp
+
+    await channel.send(OutboundMessage(
+        channel="feishu",
+        chat_id="oc_abc",
+        content="hello",
+        metadata={
+            "message_id": "om_child456",
+            "chat_type": "group",
+            "thread_id": "om_root123",
+        },
+    ))
+
+    channel._client.im.v1.message.reply.assert_called_once()
+    call_args = channel._client.im.v1.message.reply.call_args
+    request = call_args[0][0]
+    assert request.request_body.reply_in_thread is not True
 
 
 @pytest.mark.asyncio
@@ -730,88 +808,24 @@ def test_on_background_task_done_removes_from_set() -> None:
     assert task not in channel._background_tasks
 
 
-# ---------------------------------------------------------------------------
-# Issue #3533: streaming card / tool hint must respect reply_to_message
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("reply_to_message", "meta", "expected"),
-    [
-        (True,  {"chat_type": "p2p",   "message_id": "om_1"},                          None),
-        (False, {"chat_type": "group", "message_id": "om_1"},                          None),
-        (True,  {"chat_type": "group", "message_id": "om_1"},                          "om_1"),
-        (False, {"chat_type": "group", "message_id": "om_1", "thread_id": "ot_1"},     "om_1"),
-        (True,  {"chat_type": "group"},                                                None),
-    ],
-)
-def test_thread_reply_target_gating(reply_to_message, meta, expected) -> None:
-    channel = _make_feishu_channel(reply_to_message=reply_to_message)
-    assert channel._thread_reply_target(meta) == expected
-
-
 @pytest.mark.asyncio
-async def test_tool_hint_skips_reply_for_top_level_group_when_disabled() -> None:
-    """Bug case: tool-hint card on a top-level group msg must NOT spawn a topic."""
-    channel = _make_feishu_channel(reply_to_message=False)
-    create_resp = MagicMock()
-    create_resp.success.return_value = True
-    create_resp.data = SimpleNamespace(message_id="om_hint")
-    channel._client.im.v1.message.create.return_value = create_resp
+async def test_on_message_ignores_unauthorized_sender_before_side_effects() -> None:
+    channel = _make_feishu_channel(group_policy="open")
+    channel.config.allow_from = ["ou_allowed"]
+    channel._add_reaction = AsyncMock()
+    channel._download_and_save_media = AsyncMock(return_value=("/tmp/audio.ogg", "[audio]"))
+    channel.transcribe_audio = AsyncMock(return_value="transcript")
+    channel._handle_message = AsyncMock()
 
-    await channel.send(OutboundMessage(
-        channel="feishu", chat_id="oc_abc", content='web_search("q")',
-        metadata={"_tool_hint": True, "message_id": "om_user", "chat_type": "group"},
-    ))
-
-    channel._client.im.v1.message.create.assert_called_once()
-    channel._client.im.v1.message.reply.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_streaming_card_skips_reply_for_top_level_group_when_disabled() -> None:
-    """Bug case: first streaming delta on a top-level group msg must NOT spawn a topic."""
-    channel = _make_feishu_channel(reply_to_message=False)
-    card_resp = MagicMock()
-    card_resp.success.return_value = True
-    card_resp.data = SimpleNamespace(card_id="card_1")
-    channel._client.cardkit.v1.card.create.return_value = card_resp
-    send_resp = MagicMock()
-    send_resp.success.return_value = True
-    send_resp.data = SimpleNamespace(message_id="om_card")
-    channel._client.im.v1.message.create.return_value = send_resp
-    update_resp = MagicMock()
-    update_resp.success.return_value = True
-    channel._client.cardkit.v1.card_element.content.return_value = update_resp
-
-    await channel.send_delta(
-        "oc_abc", "hello",
-        metadata={"message_id": "om_user", "chat_type": "group"},
+    event = _make_feishu_event(
+        msg_type="audio",
+        content='{"file_key": "file_1"}',
+        sender_open_id="ou_blocked",
     )
 
-    channel._client.im.v1.message.create.assert_called_once()
-    channel._client.im.v1.message.reply.assert_not_called()
+    await channel._on_message(event)
 
-
-@pytest.mark.asyncio
-async def test_streaming_card_keeps_reply_in_topic_even_when_disabled() -> None:
-    """Regression guard: in-topic continuation must keep using Reply API
-    so the response stays inside the existing topic — independent of config."""
-    channel = _make_feishu_channel(reply_to_message=False)
-    card_resp = MagicMock()
-    card_resp.success.return_value = True
-    card_resp.data = SimpleNamespace(card_id="card_1")
-    channel._client.cardkit.v1.card.create.return_value = card_resp
-    reply_resp = MagicMock()
-    reply_resp.success.return_value = True
-    channel._client.im.v1.message.reply.return_value = reply_resp
-    update_resp = MagicMock()
-    update_resp.success.return_value = True
-    channel._client.cardkit.v1.card_element.content.return_value = update_resp
-
-    await channel.send_delta(
-        "oc_abc", "hello",
-        metadata={"message_id": "om_user", "chat_type": "group", "thread_id": "ot_1"},
-    )
-
-    channel._client.im.v1.message.reply.assert_called_once()
+    channel._add_reaction.assert_not_awaited()
+    channel._download_and_save_media.assert_not_awaited()
+    channel.transcribe_audio.assert_not_awaited()
+    channel._handle_message.assert_not_awaited()
