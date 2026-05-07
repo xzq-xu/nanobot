@@ -98,19 +98,6 @@ def _is_deepseek_default_thinking_model(model_name: str) -> bool:
     return slug.startswith("deepseek-v4") or slug == "deepseek-reasoner"
 
 
-def _looks_like_deepseek_api_base(api_base: str | None) -> bool:
-    if not api_base:
-        return False
-    try:
-        host = urlparse(api_base if "://" in api_base else f"//{api_base}").hostname
-    except ValueError:
-        return False
-    return bool(host and "deepseek" in host.lower())
-
-
-def _looks_like_deepseek_model(model_name: str) -> bool:
-    return "deepseek" in model_name.lower()
-
 
 def _openai_compat_timeout_s() -> float:
     """Return the bounded request timeout used for OpenAI-compatible providers."""
