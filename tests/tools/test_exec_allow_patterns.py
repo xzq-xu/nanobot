@@ -13,6 +13,24 @@ def test_deny_patterns_block_rm_rf():
     assert "deny pattern filter" in result.lower()
 
 
+def test_windows_format_guard_does_not_block_powershell_format_cmdlets():
+    """PowerShell Format-* cmdlets are output formatters, not disk format commands."""
+    tool = ExecTool()
+    result = tool._guard_command(
+        'powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Format-List Name,AdapterRAM"',
+        "/tmp",
+    )
+    assert result is None
+
+
+def test_windows_format_guard_blocks_standalone_format_command():
+    """The standalone Windows format command remains blocked."""
+    tool = ExecTool()
+    result = tool._guard_command("format C:", "/tmp")
+    assert result is not None
+    assert "deny pattern filter" in result.lower()
+
+
 def test_allow_patterns_bypass_deny():
     """allow_patterns take priority: matching command skips deny check."""
     tool = ExecTool(allow_patterns=[r"rm\s+-rf\s+/tmp/"])

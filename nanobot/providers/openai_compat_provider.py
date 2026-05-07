@@ -420,7 +420,7 @@ class OpenAICompatProvider(LLMProvider):
         """Strip non-standard keys, normalize tool_call IDs."""
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
-        force_string_content = self._is_deepseek_request(model_name or self.default_model)
+        force_string_content = bool(self._spec and self._spec.name == "deepseek")
 
         def map_id(value: Any) -> Any:
             if not isinstance(value, str):
@@ -557,12 +557,6 @@ class OpenAICompatProvider(LLMProvider):
             extra = _THINKING_STYLE_MAP.get(spec.thinking_style, lambda _: None)(thinking_enabled)
             if extra:
                 kwargs.setdefault("extra_body", {}).update(extra)
-        elif self._is_deepseek_request(model_name) and reasoning_effort is not None:
-            thinking_enabled = semantic_effort not in ("none", "minimal")
-            kwargs.setdefault("extra_body", {}).update(
-                {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
-            )
-
         # Model-level thinking injection for Kimi thinking-capable models.
         # Strip any provider prefix (e.g. "moonshotai/") before the set lookup
         # so that OpenRouter-style names like "moonshotai/kimi-k2.5" are handled
