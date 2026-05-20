@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,11 @@ from nanobot.utils.runtime import (
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
+_PERSISTED_CONTENT_BLOCKED_PLACEHOLDER = "[Assistant reply blocked by model content policy.]"
+_CONTENT_BLOCKED_ERROR_RE = re.compile(
+    r"censorship_blocked|content you provided|machine outputted is blocked|output.*blocked|unavailable for legal reasons|\b451\b",
+    re.IGNORECASE,
+)
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
@@ -489,7 +495,7 @@ class AgentRunner:
                 final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
                 error = final_content
-                self._append_model_error_placeholder(messages)
+                self._append_model_error_placeholder(messages, final_content)
                 context.final_content = final_content
                 context.error = error
                 context.stop_reason = stop_reason
@@ -1023,10 +1029,16 @@ class AgentRunner:
         messages.append(build_assistant_message(content))
 
     @staticmethod
-    def _append_model_error_placeholder(messages: list[dict[str, Any]]) -> None:
+    def _append_model_error_placeholder(messages: list[dict[str, Any]], error_text: str | None = None) -> None:
         if messages and messages[-1].get("role") == "assistant" and not messages[-1].get("tool_calls"):
             return
-        messages.append(build_assistant_message(_PERSISTED_MODEL_ERROR_PLACEHOLDER))
+        messages.append(build_assistant_message(AgentRunner._model_error_placeholder(error_text)))
+
+    @staticmethod
+    def _model_error_placeholder(error_text: str | None) -> str:
+        if error_text and _CONTENT_BLOCKED_ERROR_RE.search(error_text):
+            return _PERSISTED_CONTENT_BLOCKED_PLACEHOLDER
+        return _PERSISTED_MODEL_ERROR_PLACEHOLDER
 
     def _normalize_tool_result(
         self,

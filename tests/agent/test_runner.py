@@ -1264,6 +1264,44 @@ async def test_llm_error_not_appended_to_session_messages():
 
 
 @pytest.mark.asyncio
+async def test_content_blocked_llm_error_persists_classified_placeholder():
+    """Content policy errors should be classified without persisting provider text."""
+    from nanobot.agent.runner import (
+        AgentRunSpec,
+        AgentRunner,
+        _PERSISTED_CONTENT_BLOCKED_PLACEHOLDER,
+    )
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content=(
+            "Error: {'message': 'The content you provided or machine outputted is blocked.', "
+            "'type': 'censorship_blocked'}"
+        ),
+        finish_reason="error",
+        tool_calls=[],
+        usage={},
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "error"
+    assert "censorship_blocked" in result.final_content
+    assistant_msgs = [m for m in result.messages if m.get("role") == "assistant"]
+    assert assistant_msgs[-1]["content"] == _PERSISTED_CONTENT_BLOCKED_PLACEHOLDER
+    assert "censorship_blocked" not in assistant_msgs[-1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_streamed_flag_not_set_on_llm_error(tmp_path):
     """When LLM errors during a streaming-capable channel interaction,
     _streamed must NOT be set so ChannelManager delivers the error."""
