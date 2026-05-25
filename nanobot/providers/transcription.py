@@ -7,6 +7,25 @@ from pathlib import Path
 import httpx
 from loguru import logger
 
+_TRANSCRIPTIONS_PATH = "audio/transcriptions"
+
+
+def _resolve_transcription_url(api_base: str | None, default_url: str) -> str:
+    """Resolve the full transcription endpoint URL.
+
+    Accepts either a chat-style base (e.g. ``https://api.groq.com/openai/v1``)
+    or a complete URL already ending in ``/audio/transcriptions``. A chat-style
+    base — the form users naturally copy from their LLM provider config — gets
+    the path appended instead of being POSTed verbatim and 404ing (#3637).
+    """
+    if not api_base:
+        return default_url
+    base = api_base.rstrip("/")
+    if base.endswith(_TRANSCRIPTIONS_PATH):
+        return base
+    return f"{base}/{_TRANSCRIPTIONS_PATH}"
+
+
 # Up to 3 retries (4 attempts total) with exponential backoff on transient
 # failures. Whisper endpoints occasionally return 502/503 under load, and
 # mobile-network transcription callers hit sporadic connect/read errors.
@@ -45,7 +64,7 @@ async def _post_transcription_with_retry(
     try:
         data = path.read_bytes()
     except OSError as e:
-        logger.error("{} transcription error: cannot read audio file: {}", provider_label, e)
+        logger.exception("{} transcription error: cannot read audio file: {}", provider_label, e)
         return ""
     headers = {"Authorization": f"Bearer {api_key}"}
 
@@ -70,7 +89,7 @@ async def _post_transcription_with_retry(
                     )
                     await asyncio.sleep(_BACKOFF_S[attempt])
                     continue
-                logger.error(
+                logger.exception(
                     "{} transcription error after {} attempts: {}",
                     provider_label,
                     _MAX_RETRIES + 1,
@@ -78,7 +97,7 @@ async def _post_transcription_with_retry(
                 )
                 return ""
             except Exception as e:
-                logger.error("{} transcription error: {}", provider_label, e)
+                logger.exception("{} transcription error: {}", provider_label, e)
                 return ""
 
             if response.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
@@ -95,13 +114,13 @@ async def _post_transcription_with_retry(
             try:
                 response.raise_for_status()
             except Exception as e:
-                logger.error("{} transcription error: {}", provider_label, e)
+                logger.exception("{} transcription error: {}", provider_label, e)
                 return ""
 
             try:
                 payload = response.json()
             except Exception as e:
-                logger.error(
+                logger.exception(
                     "{} transcription error: malformed response body: {}",
                     provider_label,
                     e,
@@ -127,12 +146,12 @@ class OpenAITranscriptionProvider:
         language: str | None = None,
     ):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.api_url = (
-            api_base
-            or os.environ.get("OPENAI_TRANSCRIPTION_BASE_URL")
-            or "https://api.openai.com/v1/audio/transcriptions"
+        self.api_url = _resolve_transcription_url(
+            api_base or os.environ.get("OPENAI_TRANSCRIPTION_BASE_URL"),
+            "https://api.openai.com/v1/audio/transcriptions",
         )
         self.language = language or None
+        logger.debug("OpenAI transcription endpoint: {}", self.api_url)
 
     async def transcribe(self, file_path: str | Path) -> str:
         if not self.api_key:
@@ -166,12 +185,12 @@ class GroqTranscriptionProvider:
         language: str | None = None,
     ):
         self.api_key = api_key or os.environ.get("GROQ_API_KEY")
-        self.api_url = (
-            api_base
-            or os.environ.get("GROQ_BASE_URL")
-            or "https://api.groq.com/openai/v1/audio/transcriptions"
+        self.api_url = _resolve_transcription_url(
+            api_base or os.environ.get("GROQ_BASE_URL"),
+            "https://api.groq.com/openai/v1/audio/transcriptions",
         )
         self.language = language or None
+        logger.debug("Groq transcription endpoint: {}", self.api_url)
 
     async def transcribe(self, file_path: str | Path) -> str:
         """

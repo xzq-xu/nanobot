@@ -308,8 +308,8 @@ if DISCORD_AVAILABLE:
             fallback = "\n".join(f"[attachment: {name} - send failed]" for name in failed_media)
             return split_message(fallback, MAX_MESSAGE_LEN)
 
-        @staticmethod
         def _build_reply_context(
+            self,
             channel: Messageable,
             reply_to: str | None,
         ) -> tuple[discord.PartialMessage | None, discord.AllowedMentions]:
@@ -577,6 +577,7 @@ class DiscordChannel(BaseChannel):
                 media=media_paths,
                 metadata=metadata,
                 session_key=session_key,
+                is_dm=message.guild is None,
             )
         except Exception:
             await self._clear_reactions(channel_id)
