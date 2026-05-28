@@ -440,6 +440,7 @@ class SessionManager:
             metadata: dict[str, Any] = {}
             created_at: datetime | None = None
             updated_at: datetime | None = None
+            stored_key: str | None = None
             last_consolidated = 0
             skipped = 0
 
@@ -455,6 +456,9 @@ class SessionManager:
                         continue
 
                     if data.get("_type") == "metadata":
+                        raw_key = data.get("key")
+                        if isinstance(raw_key, str) and raw_key:
+                            stored_key = raw_key
                         metadata = data.get("metadata", {})
                         if data.get("created_at"):
                             with suppress(ValueError, TypeError):
@@ -473,7 +477,7 @@ class SessionManager:
                 return None
 
             return Session(
-                key=key,
+                key=stored_key or key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
@@ -647,6 +651,7 @@ class SessionManager:
                             fallback_preview = ""
                             scanned_records = 0
                             scanned_chars = 0
+                            skipped_preview = 0
                             for line in f:
                                 if not line.strip():
                                     continue
@@ -657,7 +662,11 @@ class SessionManager:
                                     or scanned_chars > _SESSION_LIST_PREVIEW_MAX_CHARS
                                 ):
                                     break
-                                item = json.loads(line)
+                                try:
+                                    item = json.loads(line)
+                                except json.JSONDecodeError:
+                                    skipped_preview += 1
+                                    continue
                                 if item.get("_type") == "metadata":
                                     continue
                                 text = _message_preview_text(item)
@@ -668,6 +677,12 @@ class SessionManager:
                                     break
                                 if not fallback_preview and item.get("role") == "assistant":
                                     fallback_preview = text
+                            if skipped_preview:
+                                logger.warning(
+                                    "Skipped {} corrupt preview lines in session {}",
+                                    skipped_preview,
+                                    key,
+                                )
                             preview = preview or fallback_preview
                             sessions.append({
                                 "key": key,
