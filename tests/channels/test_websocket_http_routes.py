@@ -95,6 +95,7 @@ async def test_bootstrap_returns_token_for_localhost(
         body = resp.json()
         assert body["token"].startswith("nbwt_")
         assert body["ws_path"] == "/"
+        assert body["ws_url"] == "ws://127.0.0.1:29901/"
         assert body["expires_in"] > 0
         assert isinstance(body.get("model_name"), str)
     finally:
@@ -147,7 +148,7 @@ async def test_cli_apps_routes_require_token_and_return_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "nanobot.channels.websocket.cli_apps_payload",
+        "nanobot.webui.settings_routes.cli_apps_payload",
         lambda: {
             "apps": [
                 {
@@ -172,7 +173,7 @@ async def test_cli_apps_routes_require_token_and_return_payload(
         },
     )
     monkeypatch.setattr(
-        "nanobot.channels.websocket.cli_apps_action",
+        "nanobot.webui.settings_routes.cli_apps_action",
         lambda action, query: {
             "apps": [],
             "installed_count": 1,
@@ -279,7 +280,7 @@ async def test_mcp_presets_routes_require_token_and_return_payload(
         return {"ok": True, "message": "MCP config reloaded.", "requires_restart": False}
 
     monkeypatch.setattr(
-        "nanobot.channels.websocket.request_mcp_reload",
+        "nanobot.webui.settings_routes.request_mcp_reload",
         _hot_reload,
     )
     channel = _ch(bus, session_manager=_seed_session(tmp_path), port=29913)
@@ -732,6 +733,17 @@ def test_bootstrap_accepts_static_token_as_secret(bus: MagicMock) -> None:
     assert resp.status_code == 200
     body = json.loads(resp.body)
     assert body["token"].startswith("nbwt_")
+
+
+def test_bootstrap_ws_url_uses_forwarded_https_host(bus: MagicMock) -> None:
+    channel = _ch(bus, host="127.0.0.1", port=29931)
+    resp = channel._handle_bootstrap(
+        _LOCAL,
+        _FakeReq({"Host": "nanobot.example", "X-Forwarded-Proto": "https"}),
+    )
+    assert resp.status_code == 200
+    body = json.loads(resp.body)
+    assert body["ws_url"] == "wss://nanobot.example/"
 
 
 def test_localhost_without_auth_is_valid(bus: MagicMock) -> None:

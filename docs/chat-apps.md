@@ -51,6 +51,43 @@ Connect nanobot to your favorite chat platform. Want to build your own? See the 
 nanobot gateway
 ```
 
+**Webhook mode (optional)**
+
+Telegram uses long polling by default. To receive updates through a webhook, expose
+a public HTTPS URL that forwards to nanobot's local listener and set `mode` to
+`webhook`:
+
+```json
+{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "YOUR_BOT_TOKEN",
+      "mode": "webhook",
+      "webhookUrl": "https://example.com/telegram",
+      "webhookListenHost": "127.0.0.1",
+      "webhookListenPort": 8081,
+      "webhookPath": "/telegram",
+      "webhookSecretToken": "CHANGE_ME_RANDOM_SECRET",
+      "webhookMaxConnections": 4,
+      "allowFrom": ["YOUR_USER_ID"]
+    }
+  }
+}
+```
+
+> `webhookSecretToken` is required in webhook mode. Do not expose the local
+> webhook listener directly to the public internet without a reverse proxy or
+> tunnel in front of it. TLS/Host policy is handled by your proxy; nanobot only
+> listens on `webhookListenHost:webhookListenPort` and validates Telegram's
+> webhook secret token. `webhookMaxConnections` defaults to `4`; nanobot
+> still serializes Telegram updates per conversation before forwarding them to
+> the agent.
+>
+> `webhookUrl` is the public HTTPS URL registered with Telegram.
+> `webhookPath` is the local path nanobot listens on. They often use the same
+> path, but may differ when a reverse proxy or tunnel rewrites the request path.
+
 </details>
 
 <details>
@@ -207,6 +244,7 @@ for reliable encryption, password login is recommended instead. If the
       "userId": "@nanobot:matrix.org",
       "password": "mypasswordhere",
       "e2eeEnabled": true,
+      "sasVerification": true,
       "allowFrom": ["@your_user:matrix.org"],
       "groupPolicy": "open",
       "groupAllowFrom": [],
@@ -226,6 +264,7 @@ for reliable encryption, password login is recommended instead. If the
 | `groupAllowFrom` | Room allowlist (used when policy is `allowlist`). |
 | `allowRoomMentions` | Accept `@room` mentions in mention mode. |
 | `e2eeEnabled` | E2EE support (default `true`). Set `false` for plaintext-only. |
+| `sasVerification` | Auto-complete SAS device verification requests from allowed users (default `false`). Useful for Element X, which does not expose manual trust for third-party devices. |
 | `maxMediaBytes` | Max attachment size (default `20MB`). Set `0` to block all media. |
 
 

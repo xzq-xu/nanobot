@@ -469,6 +469,28 @@ def test_config_auto_detects_xiaomi_mimo_from_model_keyword():
     assert config.get_api_base() == "https://api.xiaomimimo.com/v1"
 
 
+def test_config_explicit_minimax_anthropic_provider_uses_default_api_base():
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "minimax_anthropic",
+                    "model": "MiniMax-M2.7-highspeed",
+                }
+            },
+            "providers": {
+                "minimaxAnthropic": {
+                    "apiKey": "test-key",
+                }
+            },
+        }
+    )
+
+    assert config.get_provider_name() == "minimax_anthropic"
+    assert config.get_api_key() == "test-key"
+    assert config.get_api_base() == "https://api.minimax.io/anthropic"
+
+
 def test_config_auto_detects_ollama_from_local_api_base():
     config = Config.model_validate(
         {
@@ -930,6 +952,33 @@ def test_heartbeat_retains_recent_messages_by_default():
     assert config.gateway.heartbeat.keep_recent_messages == 8
 
 
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        ("", False),
+        ("# Title\n\n## Active Tasks\n", False),
+        ("<!--\nmulti-line\ncomment\n-->\n", False),  # block comment, not tasks
+        ("<!-- single line -->\n", False),
+        ("## Active Tasks\n\n- water the plants\n", True),
+        ("## Active Tasks\n\n### Garden\n\n- water the plants\n", True),
+        ("## Notes\n\nsome random note\n", False),
+        ("stray text before any heading\n## Active Tasks\n\n- task\n", True),
+        ("stray text before any heading\n", False),
+    ],
+)
+def test_heartbeat_has_active_tasks(content, expected):
+    from nanobot.cli.commands import _heartbeat_has_active_tasks
+
+    assert _heartbeat_has_active_tasks(content) is expected
+
+
+def test_heartbeat_skips_bundled_template():
+    from nanobot.cli.commands import _heartbeat_has_active_tasks
+    from nanobot.utils.helpers import load_bundled_template
+
+    assert _heartbeat_has_active_tasks(load_bundled_template("HEARTBEAT.md")) is False
+
+
 def _write_instance_config(tmp_path: Path) -> Path:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -1210,7 +1259,7 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     monkeypatch.setattr("nanobot.cli.commands.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
     monkeypatch.setattr(
-        "nanobot.utils.evaluator.evaluate_response",
+        "nanobot.cli.commands.evaluate_response",
         _capture_evaluate_response,
     )
 
@@ -1342,7 +1391,7 @@ def test_gateway_cron_job_suppresses_intermediate_progress(
     monkeypatch.setattr("nanobot.cli.commands.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _StopAfterCronSetup)
     monkeypatch.setattr(
-        "nanobot.utils.evaluator.evaluate_response",
+        "nanobot.cli.commands.evaluate_response",
         _always_reject,
     )
 
@@ -1521,6 +1570,35 @@ def test_gateway_cli_port_overrides_configured_port(monkeypatch, tmp_path: Path)
     assert "port 18792" in result.stdout
 
 
+def test_configure_desktop_gateway_forces_local_websocket_only() -> None:
+    from nanobot.cli.commands import _configure_desktop_gateway
+
+    config = Config()
+    config.channels.__pydantic_extra__ = {
+        "telegram": {"enabled": True, "token": "x"},
+        "websocket": {"enabled": False, "port": 8765},
+    }
+
+    _configure_desktop_gateway(
+        config,
+        webui_port=29888,
+        webui_socket="/tmp/nanobot-test.sock",
+        token_issue_secret="secret",
+    )
+
+    extras = config.channels.__pydantic_extra__ or {}
+    assert config.gateway.host == "127.0.0.1"
+    assert config.gateway.port == 29888
+    assert config.gateway.heartbeat.enabled is False
+    assert extras["telegram"]["enabled"] is False
+    assert extras["websocket"]["enabled"] is True
+    assert extras["websocket"]["host"] == "127.0.0.1"
+    assert extras["websocket"]["port"] == 29888
+    assert extras["websocket"]["unix_socket_path"] == "/tmp/nanobot-test.sock"
+    assert extras["websocket"]["token_issue_secret"] == "secret"
+    assert extras["websocket"]["websocket_requires_token"] is True
+
+
 def test_gateway_health_endpoint_binds_and_serves_expected_responses(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1589,16 +1667,6 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
         def register_system_job(self, _job) -> None:
             return None
 
-    class _FakeHeartbeatService:
-        def __init__(self, **_kwargs) -> None:
-            return None
-
-        async def start(self) -> None:
-            return None
-
-        def stop(self) -> None:
-            return None
-
     class _FakeServer:
         async def __aenter__(self):
             return self
@@ -1645,7 +1713,6 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
     monkeypatch.setattr("nanobot.cli.commands.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
     monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCronService)
-    monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", _FakeHeartbeatService)
     monkeypatch.setattr("asyncio.start_server", _fake_start_server)
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])

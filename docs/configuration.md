@@ -126,6 +126,7 @@ ANTHROPIC_API_KEY="$(bw get password api/anthropic)" nanobot agent
 > - **VolcEngine / BytePlus Coding Plan**: Use dedicated providers `volcengineCodingPlan` or `byteplusCodingPlan` instead of the pay-per-use `volcengine` / `byteplus` providers.
 > - **Zhipu Coding Plan**: If you're on Zhipu's coding plan, set `"apiBase": "https://open.bigmodel.cn/api/coding/paas/v4"` in your zhipu provider config.
 > - **Alibaba Cloud BaiLian**: If you're using Alibaba Cloud BaiLian's OpenAI-compatible endpoint, set `"apiBase": "https://dashscope.aliyuncs.com/compatible-mode/v1"` in your dashscope provider config.
+> - **StepFun Step Plan**: If you're on StepFun's Step Plan subscription, set `"apiBase": "https://api.stepfun.com/step_plan/v1"` in your stepfun provider config. Supported models include `step-3.5-flash`, `step-3.5-flash-2603`, and `step-router-v1`.
 > - **Step Fun (Mainland China)**: If your API key is from Step Fun's mainland China platform (stepfun.com), set `"apiBase": "https://api.stepfun.com/v1"` in your stepfun provider config.
 > - **Xiaomi MiMo thinking mode**: MiMo models (e.g. `mimo-v2.5-pro`) default to enabled thinking. Use `agents.defaults.reasoningEffort: "none"` to disable it, or `"low"` / `"medium"` / `"high"` to keep it on. Omitting the field preserves the provider's per-model default.
 > - **Xiaomi MiMo Token Plan**: If you're on MiMo's token plan, set `"apiBase": "https://token-plan-sgp.xiaomimimo.com/v1"` in your xiaomi_mimo provider config.
@@ -545,6 +546,35 @@ the model name contains `mimo`. The default API base is
 > auto-matches to the `xiaomi_mimo` provider spec. Use an API key from the MiMo
 > token plan console and check the MiMo platform for the latest supported model
 > names.
+
+</details>
+
+<details>
+<summary><b>StepFun Step Plan (subscription)</b></summary>
+
+Step Plan is StepFun's subscription-based service for high-frequency AI developers.
+If you're on a Step Plan subscription, override `apiBase` in the existing `stepfun`
+provider config to point to the dedicated Step Plan endpoint.
+
+```json
+{
+  "providers": {
+    "stepfun": {
+      "apiKey": "${STEPFUN_API_KEY}",
+      "apiBase": "https://api.stepfun.com/step_plan/v1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "stepfun",
+      "model": "step-3.5-flash"
+    }
+  }
+}
+```
+
+Supported models include `step-3.5-flash`, `step-3.5-flash-2603`, and
+`step-router-v1`.
 
 </details>
 
@@ -1013,6 +1043,7 @@ Global settings that apply to all channels. Configure under the `channels` secti
   "channels": {
     "sendProgress": true,
     "sendToolHints": false,
+    "extractDocumentText": true,
     "sendMaxRetries": 3,
     "transcriptionProvider": "groq",
     "transcriptionLanguage": null,
@@ -1026,6 +1057,7 @@ Global settings that apply to all channels. Configure under the `channels` secti
 | `sendProgress` | `true` | Stream agent's text progress to the channel |
 | `sendToolHints` | `false` | Stream tool-call hints (e.g. `read_file("…")`) |
 | `showReasoning` | `true` | Allow channels to surface model reasoning/thinking content (DeepSeek-R1 `reasoning_content`, Anthropic `thinking_blocks`, inline `<think>` tags). Reasoning flows as a dedicated stream with `_reasoning_delta` / `_reasoning_end` markers — channels override `send_reasoning_delta` / `send_reasoning_end` to render in-place updates. Even with `true`, channels without those overrides stay no-op silently. Currently surfaced on CLI and WebSocket/WebUI (italic shimmer header, auto-collapses after the stream ends); Telegram / Slack / Discord / Feishu / WeChat / Matrix keep the base no-op until their bubble UI is adapted. Independent of `sendProgress`. |
+| `extractDocumentText` | `true` | Extract supported document/text attachments into the model prompt. Set to `false` to keep document content out of the prompt and include attachment path references instead. |
 | `sendMaxRetries` | `3` | Max delivery attempts per outbound message, including the initial send (0-10 configured, minimum 1 actual attempt) |
 | `transcriptionProvider` | `"groq"` | Voice transcription backend: `"groq"` (free tier, default) or `"openai"`. API key and optional `apiBase` are auto-resolved from the matching provider config. Chat-style bases such as `https://api.groq.com/openai/v1` are normalized to the audio transcription endpoint. |
 | `transcriptionLanguage` | `null` | Optional ISO-639-1 language hint for audio transcription, e.g. `"en"`, `"ko"`, `"ja"`. |
@@ -1502,7 +1534,7 @@ By default, nanobot uses `UTC` for runtime time context. If you want the agent t
 }
 ```
 
-This affects runtime time strings shown to the model, such as runtime context and heartbeat prompts. It also becomes the default timezone for cron schedules when a cron expression omits `tz`, and for one-shot `at` times when the ISO datetime has no explicit offset.
+This affects runtime time strings shown to the model, such as runtime context. It also becomes the default timezone for cron schedules when a cron expression omits `tz`, and for one-shot `at` times when the ISO datetime has no explicit offset.
 
 Common examples: `UTC`, `America/New_York`, `America/Los_Angeles`, `Europe/London`, `Europe/Berlin`, `Asia/Tokyo`, `Asia/Shanghai`, `Asia/Singapore`, `Australia/Sydney`.
 
