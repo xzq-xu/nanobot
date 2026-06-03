@@ -81,7 +81,12 @@ async def test_llm_error_not_appended_to_session_messages():
 @pytest.mark.asyncio
 async def test_llm_arrearage_error_surfaces_clear_message():
     """Arrearage errors yield a clear user-facing message, not a raw dump (#3006)."""
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner, _ARREARAGE_ERROR_MESSAGE
+    from nanobot.agent.runner import (
+        AgentRunSpec,
+        AgentRunner,
+        _ARREARAGE_ERROR_MESSAGE,
+        _PERSISTED_ARREARAGE_ERROR_PLACEHOLDER,
+    )
 
     provider = MagicMock(spec=LLMProvider)
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -101,6 +106,8 @@ async def test_llm_arrearage_error_surfaces_clear_message():
 
     assert result.stop_reason == "error"
     assert result.final_content == _ARREARAGE_ERROR_MESSAGE
+    assistant_msgs = [m for m in result.messages if m.get("role") == "assistant"]
+    assert assistant_msgs[-1]["content"] == _PERSISTED_ARREARAGE_ERROR_PLACEHOLDER
 
 
 @pytest.mark.asyncio

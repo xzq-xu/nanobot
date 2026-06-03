@@ -59,9 +59,14 @@ _ARREARAGE_ERROR_MESSAGE = (
     "account is in arrears. Please top up / check the billing status of your API key and try again."
 )
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
+_PERSISTED_ARREARAGE_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to quota error.]"
 _PERSISTED_CONTENT_BLOCKED_PLACEHOLDER = "[Assistant reply blocked by model content policy.]"
 _CONTENT_BLOCKED_ERROR_RE = re.compile(
     r"censorship_blocked|content you provided|machine outputted is blocked|output.*blocked|unavailable for legal reasons|\b451\b",
+    re.IGNORECASE,
+)
+_ARREARAGE_ERROR_RE = re.compile(
+    r"out of quota|in arrears|top up|billing status|payment required|insufficient[_\s-]*(?:quota|balance|points|credits)|quota exhausted",
     re.IGNORECASE,
 )
 _MAX_EMPTY_RETRIES = 2
@@ -1137,6 +1142,8 @@ class AgentRunner:
     def _model_error_placeholder(error_text: str | None) -> str:
         if error_text and _CONTENT_BLOCKED_ERROR_RE.search(error_text):
             return _PERSISTED_CONTENT_BLOCKED_PLACEHOLDER
+        if error_text and _ARREARAGE_ERROR_RE.search(error_text):
+            return _PERSISTED_ARREARAGE_ERROR_PLACEHOLDER
         return _PERSISTED_MODEL_ERROR_PLACEHOLDER
 
     def _normalize_tool_result(
