@@ -39,7 +39,13 @@ def _make_full_loop(tmp_path: Path) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Test title"))
-    return AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    WebuiTurnCoordinator(
+        bus=loop.bus,
+        sessions=loop.sessions,
+        schedule_background=lambda coro: loop._schedule_background(coro),
+    ).subscribe(loop.runtime_events)
+    return loop
 
 
 def test_agent_loop_llm_runtime_reflects_current_provider_and_model(tmp_path: Path) -> None:
@@ -586,16 +592,16 @@ async def test_internal_continuation_queues_turn_without_fake_user_history(
                 "paused",
                 [],
                 [*initial_messages, {"role": "assistant", "content": "paused"}],
-                "max_iterations",
-                False,
-            )
+                    "max_iterations",
+                    False,
+                )
         return (
             "done",
             [],
             [*initial_messages, {"role": "assistant", "content": "done"}],
-            "completed",
-            False,
-        )
+                "completed",
+                False,
+            )
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
     pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
@@ -659,9 +665,9 @@ async def test_internal_continuation_preserves_streaming_route_metadata(
                 "paused",
                 [],
                 [*initial_messages, {"role": "assistant", "content": "paused"}],
-                "max_iterations",
-                False,
-            )
+                    "max_iterations",
+                    False,
+                )
         assert on_stream is not None
         assert on_stream_end is not None
         await on_stream("done")
@@ -738,9 +744,9 @@ async def test_websocket_internal_continuation_keeps_single_visible_run(
                 "paused",
                 [],
                 [*initial_messages, {"role": "assistant", "content": "paused"}],
-                "max_iterations",
-                False,
-            )
+                    "max_iterations",
+                    False,
+                )
         return (
             "done",
             [],

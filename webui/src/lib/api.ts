@@ -1,6 +1,7 @@
 import type {
   ChatSummary,
   CliAppsPayload,
+  FilePreviewPayload,
   ImageGenerationSettingsUpdate,
   McpPresetsPayload,
   ModelConfigurationCreate,
@@ -8,15 +9,22 @@ import type {
   NetworkSafetySettingsUpdate,
   ProviderModelsPayload,
   ProviderSettingsUpdate,
+  SessionAutomationsPayload,
   SettingsPayload,
   SettingsUpdate,
   SidebarStatePayload,
+  SkillDetail,
+  SkillsPayload,
   SlashCommand,
+  TranscriptionSettingsUpdate,
   WebSearchSettingsUpdate,
   WorkspacesPayload,
   WebuiThreadPersistedPayload,
   WorkspaceScopePayload,
 } from "./types";
+import { fetchWithTimeout } from "./http";
+
+const API_READ_TIMEOUT_MS = 20_000;
 
 export class ApiError extends Error {
   status: number;
@@ -31,15 +39,20 @@ async function request<T>(
   url: string,
   token: string,
   init?: RequestInit,
+  timeoutMs: number = 0,
 ): Promise<T> {
-  const res = await fetch(url, {
-    ...(init ?? {}),
-    headers: {
-      ...(init?.headers ?? {}),
-      Authorization: `Bearer ${token}`,
+  const res = await fetchWithTimeout(
+    url,
+    {
+      ...(init ?? {}),
+      headers: {
+        ...(init?.headers ?? {}),
+        Authorization: `Bearer ${token}`,
+      },
+      credentials: "same-origin",
     },
-    credentials: "same-origin",
-  });
+    timeoutMs,
+  );
   if (!res.ok) {
     const text = typeof res.text === "function" ? (await res.text()).trim() : "";
     throw new ApiError(res.status, text || `HTTP ${res.status}`);
@@ -95,6 +108,8 @@ export async function listSessions(
   const body = await request<{ sessions: Row[] }>(
     `${base}/api/sessions`,
     token,
+    undefined,
+    API_READ_TIMEOUT_MS,
   );
   return body.sessions.map((s) => ({
     key: s.key,
@@ -115,13 +130,67 @@ export async function fetchWebuiThread(
   base: string = "",
 ): Promise<WebuiThreadPersistedPayload | null> {
   const url = `${base}/api/sessions/${encodeURIComponent(key)}/webui-thread`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     headers: { Authorization: `Bearer ${token}` },
     credentials: "same-origin",
   });
   if (res.status === 404) return null;
   if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`);
   return (await res.json()) as WebuiThreadPersistedPayload;
+}
+
+export async function fetchFilePreview(
+  token: string,
+  key: string,
+  path: string,
+  base: string = "",
+): Promise<FilePreviewPayload> {
+  const query = new URLSearchParams();
+  query.set("path", path);
+  return request<FilePreviewPayload>(
+    `${base}/api/sessions/${encodeURIComponent(key)}/file-preview?${query}`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function fetchSessionAutomations(
+  token: string,
+  key: string,
+  base: string = "",
+): Promise<SessionAutomationsPayload> {
+  return request<SessionAutomationsPayload>(
+    `${base}/api/sessions/${encodeURIComponent(key)}/automations`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function fetchSkills(
+  token: string,
+  base: string = "",
+): Promise<SkillsPayload> {
+  return request<SkillsPayload>(
+    `${base}/api/webui/skills`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function fetchSkillDetail(
+  token: string,
+  name: string,
+  base: string = "",
+): Promise<SkillDetail> {
+  return request<SkillDetail>(
+    `${base}/api/webui/skills/${encodeURIComponent(name)}`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
 }
 
 export async function deleteSession(
@@ -140,21 +209,48 @@ export async function fetchSettings(
   token: string,
   base: string = "",
 ): Promise<SettingsPayload> {
-  return request<SettingsPayload>(`${base}/api/settings`, token);
+  return request<SettingsPayload>(
+    `${base}/api/settings`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function fetchSettingsUsage(
+  token: string,
+  base: string = "",
+): Promise<NonNullable<SettingsPayload["usage"]>> {
+  return request<NonNullable<SettingsPayload["usage"]>>(
+    `${base}/api/settings/usage`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
 }
 
 export async function fetchWorkspaces(
   token: string,
   base: string = "",
 ): Promise<WorkspacesPayload> {
-  return request<WorkspacesPayload>(`${base}/api/workspaces`, token);
+  return request<WorkspacesPayload>(
+    `${base}/api/workspaces`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
 }
 
 export async function fetchCliApps(
   token: string,
   base: string = "",
 ): Promise<CliAppsPayload> {
-  return request<CliAppsPayload>(`${base}/api/settings/cli-apps`, token);
+  return request<CliAppsPayload>(
+    `${base}/api/settings/cli-apps`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
 }
 
 export async function runCliAppAction(
@@ -172,7 +268,12 @@ export async function fetchMcpPresets(
   token: string,
   base: string = "",
 ): Promise<McpPresetsPayload> {
-  return request<McpPresetsPayload>(`${base}/api/settings/mcp-presets`, token);
+  return request<McpPresetsPayload>(
+    `${base}/api/settings/mcp-presets`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
 }
 
 export async function fetchProviderModels(
@@ -185,6 +286,8 @@ export async function fetchProviderModels(
   return request<ProviderModelsPayload>(
     `${base}/api/settings/provider-models?${query}`,
     token,
+    undefined,
+    API_READ_TIMEOUT_MS,
   );
 }
 
@@ -252,7 +355,12 @@ export async function listSlashCommands(
     icon: string;
     arg_hint?: string;
   };
-  const body = await request<{ commands: Row[] }>(`${base}/api/commands`, token);
+  const body = await request<{ commands: Row[] }>(
+    `${base}/api/commands`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
   return body.commands
     .filter((command) => !["/stop", "/restart"].includes(command.command))
     .map((command) => ({
@@ -268,7 +376,12 @@ export async function fetchSidebarState(
   token: string,
   base: string = "",
 ): Promise<SidebarStatePayload> {
-  return request<SidebarStatePayload>(`${base}/api/webui/sidebar-state`, token);
+  return request<SidebarStatePayload>(
+    `${base}/api/webui/sidebar-state`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
 }
 
 export async function updateSidebarState(
@@ -432,6 +545,24 @@ export async function updateImageGenerationSettings(
   query.set("max_images_per_turn", String(update.maxImagesPerTurn));
   return request<SettingsPayload>(
     `${base}/api/settings/image-generation/update?${query}`,
+    token,
+  );
+}
+
+export async function updateTranscriptionSettings(
+  token: string,
+  update: TranscriptionSettingsUpdate,
+  base: string = "",
+): Promise<SettingsPayload> {
+  const query = new URLSearchParams();
+  query.set("enabled", String(update.enabled));
+  query.set("provider", update.provider);
+  query.set("model", update.model);
+  query.set("language", update.language);
+  query.set("max_duration_sec", String(update.maxDurationSec));
+  query.set("max_upload_mb", String(update.maxUploadMb));
+  return request<SettingsPayload>(
+    `${base}/api/settings/transcription/update?${query}`,
     token,
   );
 }

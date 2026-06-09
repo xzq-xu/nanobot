@@ -5,8 +5,10 @@ import os
 import select
 import signal
 import sys
+import uuid
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +21,9 @@ if sys.platform == "win32":
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import typer
-from loguru import logger
+# Keep console encoding setup before importing CLI UI/logging libraries.
+import typer  # noqa: E402
+from loguru import logger  # noqa: E402
 
 # Remove default handler and re-add with unified nanobot format
 logger.remove()
@@ -37,18 +40,28 @@ _log_handler_id = logger.add(
     filter=lambda record: record["extra"].setdefault("channel", "-") or True,
 )
 
-from prompt_toolkit import PromptSession, print_formatted_text
-from prompt_toolkit.application import run_in_terminal
-from prompt_toolkit.formatted_text import ANSI, HTML
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.patch_stdout import patch_stdout
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.table import Table
-from rich.text import Text
+from prompt_toolkit import PromptSession, print_formatted_text  # noqa: E402
+from prompt_toolkit.application import run_in_terminal  # noqa: E402
+from prompt_toolkit.formatted_text import ANSI, HTML  # noqa: E402
+from prompt_toolkit.history import FileHistory  # noqa: E402
+from prompt_toolkit.patch_stdout import patch_stdout  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.markdown import Markdown  # noqa: E402
+from rich.table import Table  # noqa: E402
+from rich.text import Text  # noqa: E402
 
-from nanobot import __logo__, __version__
-from nanobot.agent.loop import AgentLoop
+from nanobot import __logo__, __version__  # noqa: E402
+from nanobot.agent.loop import AgentLoop  # noqa: E402
+from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
+from nanobot.config.paths import get_workspace_path, is_default_workspace  # noqa: E402
+from nanobot.config.schema import Config  # noqa: E402
+from nanobot.utils.evaluator import evaluate_response  # noqa: E402
+from nanobot.utils.helpers import sync_workspace_templates  # noqa: E402
+from nanobot.utils.restart import (  # noqa: E402
+    consume_restart_notice_from_env,
+    format_restart_completed_message,
+    should_show_cli_restart_notice,
+)
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -72,16 +85,33 @@ class SafeFileHistory(FileHistory):
 
     def store_string(self, string: str) -> None:
         super().store_string(_sanitize_surrogates(string))
-from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
-from nanobot.config.paths import get_workspace_path, is_default_workspace
-from nanobot.config.schema import Config
-from nanobot.utils.evaluator import evaluate_response
-from nanobot.utils.helpers import sync_workspace_templates
-from nanobot.utils.restart import (
-    consume_restart_notice_from_env,
-    format_restart_completed_message,
-    should_show_cli_restart_notice,
+
+
+_WEBUI_TURN_META_KEY = "webui_turn_id"
+_WEBUI_MESSAGE_SOURCE_META_KEY = "_webui_message_source"
+_PROACTIVE_WEBUI_METADATA: ContextVar[dict[str, Any] | None] = ContextVar(
+    "proactive_webui_metadata",
+    default=None,
 )
+
+
+def _proactive_delivery_metadata(
+    channel: str,
+    metadata: dict[str, Any] | None,
+    *,
+    turn_seed: str,
+    source_label: str | None = None,
+) -> dict[str, Any]:
+    """Return channel metadata for a fresh proactive delivery turn."""
+    out = dict(metadata or {})
+    out.pop(_WEBUI_TURN_META_KEY, None)
+    if channel == "websocket":
+        out[_WEBUI_TURN_META_KEY] = f"{turn_seed}:{uuid.uuid4().hex}"
+        source: dict[str, str] = {"kind": "cron"}
+        if source_label:
+            source["label"] = source_label
+        out[_WEBUI_MESSAGE_SOURCE_META_KEY] = source
+    return out
 
 app = typer.Typer(
     name="nanobot",
@@ -738,6 +768,59 @@ def gateway(
     _run_gateway(cfg, port=port)
 
 
+DESKTOP_BOOTSTRAP_PROVIDER = "openai_codex"
+DESKTOP_BOOTSTRAP_MODEL = "openai-codex/gpt-5.1-codex"
+
+
+def _desktop_provider_error_is_recoverable(error: ValueError) -> bool:
+    message = str(error)
+    return "No API key configured" in message or "requires api_key and api_base" in message
+
+
+def _desktop_provider_needs_bootstrap(config: Config) -> bool:
+    from nanobot.providers.factory import make_provider
+
+    try:
+        make_provider(config)
+        return False
+    except ValueError as e:
+        if not _desktop_provider_error_is_recoverable(e):
+            raise
+        return True
+
+
+def _reset_desktop_config_to_unconfigured(config: Config) -> bool:
+    defaults = config.agents.defaults
+    changed = False
+    if defaults.model_preset is not None:
+        defaults.model_preset = None
+        changed = True
+    if defaults.provider:
+        defaults.provider = ""
+        changed = True
+    if defaults.model:
+        defaults.model = ""
+        changed = True
+    return changed
+
+
+def _is_persisted_desktop_bootstrap(config: Config) -> bool:
+    defaults = config.agents.defaults
+    return (
+        defaults.model_preset is None
+        and defaults.provider == DESKTOP_BOOTSTRAP_PROVIDER
+        and defaults.model == DESKTOP_BOOTSTRAP_MODEL
+        and not config.model_presets
+    )
+
+
+def _apply_desktop_runtime_bootstrap(config: Config) -> None:
+    defaults = config.agents.defaults
+    config.agents.defaults.model_preset = None
+    defaults.provider = DESKTOP_BOOTSTRAP_PROVIDER
+    defaults.model = DESKTOP_BOOTSTRAP_MODEL
+
+
 def _load_or_create_desktop_config(config: str | None, workspace: str | None) -> Config:
     """Load the desktop-owned config, creating it on first launch."""
     from nanobot.config.loader import (
@@ -751,7 +834,7 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
 
     config_path = Path(config).expanduser().resolve() if config else get_config_path()
     set_config_path(config_path)
-    created = False
+    changed = False
     if config_path.exists():
         try:
             loaded = resolve_config_env_vars(load_config(config_path))
@@ -760,16 +843,25 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
             raise typer.Exit(1)
     else:
         loaded = NanobotConfig()
-        created = True
+        changed = True
 
     if workspace:
         workspace_path = Path(workspace).expanduser()
         loaded.agents.defaults.workspace = str(workspace_path)
-        created = True
+        changed = True
 
-    if created:
+    if _is_persisted_desktop_bootstrap(loaded):
+        changed = _reset_desktop_config_to_unconfigured(loaded) or changed
+    elif _desktop_provider_needs_bootstrap(loaded):
+        changed = _reset_desktop_config_to_unconfigured(loaded) or changed
+
+    if changed:
         save_config(loaded, config_path)
-    return loaded
+
+    runtime_config = loaded.model_copy(deep=True)
+    if _desktop_provider_needs_bootstrap(runtime_config):
+        _apply_desktop_runtime_bootstrap(runtime_config)
+    return runtime_config
 
 
 def _configure_desktop_gateway(
@@ -881,19 +973,22 @@ def _run_gateway(
     from nanobot.agent.tools.cron import CronTool
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
+    from nanobot.bus.runtime_events import RuntimeEventBus
     from nanobot.channels.manager import ChannelManager
-    from nanobot.channels.websocket import publish_runtime_model_update
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
+    from nanobot.session.webui_turns import WebuiTurnCoordinator
+    from nanobot.webui.token_usage import TokenUsageHook
 
     port = port if port is not None else config.gateway.port
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
+    runtime_events = RuntimeEventBus()
     try:
         provider_snapshot = build_provider_snapshot(config)
     except ValueError as exc:
@@ -919,13 +1014,15 @@ def _run_gateway(
         session_manager=session_manager,
         image_generation_provider_configs=image_gen_provider_configs(config),
         provider_snapshot_loader=load_provider_snapshot,
-        runtime_model_publisher=lambda model, preset: publish_runtime_model_update(
-            bus,
-            model,
-            preset,
-        ),
+        runtime_events=runtime_events,
         provider_signature=provider_snapshot.signature,
+        hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
     )
+    WebuiTurnCoordinator(
+        bus=bus,
+        sessions=session_manager,
+        schedule_background=lambda coro: agent._schedule_background(coro),
+    ).subscribe(runtime_events)
 
     from nanobot.agent.loop import UNIFIED_SESSION_KEY
     from nanobot.bus.events import OutboundMessage
@@ -943,6 +1040,9 @@ def _run_gateway(
         """Publish a user-visible message and mirror it into that channel's session."""
         metadata = dict(msg.metadata or {})
         record = record or bool(metadata.pop("_record_channel_delivery", False))
+        proactive_webui_metadata = _PROACTIVE_WEBUI_METADATA.get()
+        if record and msg.channel == "websocket" and proactive_webui_metadata:
+            metadata = {**metadata, **proactive_webui_metadata}
         if metadata != (msg.metadata or {}):
             msg = OutboundMessage(
                 channel=msg.channel,
@@ -981,11 +1081,55 @@ def _run_gateway(
 
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
+            from nanobot.agent.memory import MemoryStore
+
+            dream_session_key = MemoryStore.dream_session_key
+            build_dream_commit_message = MemoryStore.build_dream_commit_message
+            prune_dream_sessions = MemoryStore.prune_dream_sessions
+
+            store = agent.context.memory
+            resp = None
             try:
-                await agent.dream.run()
-                logger.info("Dream cron job completed")
+                result = store.build_dream_prompt()
+                if result is None:
+                    logger.info("Dream: nothing to process")
+                    return None
+                prompt, last_cursor = result
+                key = dream_session_key()
+                resp = await agent.process_direct(
+                    prompt,
+                    session_key=key,
+                    ephemeral=True,
+                    tools=store.build_dream_tools(),
+                    on_progress=_silent,
+                )
+                if MemoryStore.dream_run_completed(resp):
+                    store.set_last_dream_cursor(last_cursor)
+                    logger.info("Dream cron job completed, cursor advanced to {}", last_cursor)
+                else:
+                    logger.warning(
+                        "Dream cron job did not complete; cursor remains at {}",
+                        store.get_last_dream_cursor(),
+                    )
             except Exception:
                 logger.exception("Dream cron job failed")
+            finally:
+                from nanobot.webui.token_usage import record_response_token_usage
+
+                record_response_token_usage(
+                    resp,
+                    source="dream",
+                    timezone_name=config.agents.defaults.timezone,
+                )
+                if store.git.is_initialized():
+                    msg = build_dream_commit_message(
+                        "dream: periodic memory consolidation", resp,
+                    )
+                    sha = store.git.auto_commit(msg)
+                    if sha:
+                        logger.info("Dream commit: {}", sha)
+                store.compact_history()
+                prune_dream_sessions(agent.sessions.sessions_dir)
             return None
 
         # Heartbeat is a system job that checks HEARTBEAT.md for active tasks.
@@ -1067,6 +1211,14 @@ def _run_gateway(
         if isinstance(message_tool, MessageTool):
             message_record_token = message_tool.set_record_channel_delivery(True)
 
+        proactive_webui_metadata = _proactive_delivery_metadata(
+            "websocket",
+            None,
+            turn_seed=f"cron:{job.id}",
+            source_label=job.name,
+        )
+        proactive_token = _PROACTIVE_WEBUI_METADATA.set(proactive_webui_metadata)
+
         try:
             resp = await agent.process_direct(
                 reminder_note,
@@ -1076,6 +1228,7 @@ def _run_gateway(
                 on_progress=_silent,
             )
         finally:
+            _PROACTIVE_WEBUI_METADATA.reset(proactive_token)
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
             if isinstance(message_tool, MessageTool) and message_record_token is not None:
@@ -1091,12 +1244,18 @@ def _run_gateway(
                 response, reminder_note, agent.provider, agent.model,
             )
             if should_notify:
+                proactive_metadata = _proactive_delivery_metadata(
+                    job.payload.channel or "cli",
+                    job.payload.channel_meta,
+                    turn_seed=f"cron:{job.id}",
+                    source_label=job.name,
+                )
                 await _deliver_to_channel(
                     OutboundMessage(
                         channel=job.payload.channel or "cli",
                         chat_id=job.payload.to,
                         content=response,
-                        metadata=dict(job.payload.channel_meta),
+                        metadata=proactive_metadata,
                     ),
                     record=True,
                     session_key=job.payload.session_key,
@@ -1118,6 +1277,7 @@ def _run_gateway(
         config,
         bus,
         session_manager=session_manager,
+        cron_service=cron,
         webui_runtime_model_name=_webui_runtime_model_name,
         webui_static_dist=webui_static_dist,
         webui_runtime_surface=webui_runtime_surface,
@@ -1196,13 +1356,8 @@ def _run_gateway(
         async with server:
             await server.serve_forever()
     # Register Dream system job (idempotent on restart)
-    dream_cfg = config.agents.defaults.dream
-    if dream_cfg.model_override:
-        agent.dream.model = dream_cfg.model_override
-    agent.dream.max_batch_size = dream_cfg.max_batch_size
-    agent.dream.max_iterations = dream_cfg.max_iterations
-    agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
     from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+    dream_cfg = config.agents.defaults.dream
     if dream_cfg.enabled:
         cron.register_system_job(CronJob(
             id="dream",

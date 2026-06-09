@@ -18,6 +18,9 @@ from nanobot.session.manager import SessionManager
 
 WEBUI_TRANSCRIPT_SCHEMA_VERSION = 3
 _MAX_TRANSCRIPT_FILE_BYTES = 8 * 1024 * 1024
+_WEBUI_TURN_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+WEBUI_TURN_METADATA_KEY = "webui_turn_id"
+WEBUI_MESSAGE_SOURCE_METADATA_KEY = "_webui_message_source"
 _MARKDOWN_LOCAL_IMAGE_RE = re.compile(
     r"!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(\s+(?:\"[^\"]*\"|'[^']*'))?\)"
 )
@@ -39,6 +42,15 @@ _FILE_EDIT_TOOL_NAMES: frozenset[str] = frozenset({
     "write_file",
     "edit_file",
     "apply_patch",
+})
+_TURN_DISPLAY_EVENTS: frozenset[str] = frozenset({
+    "reasoning_delta",
+    "reasoning_end",
+    "delta",
+    "stream_end",
+    "message",
+    "file_edit",
+    "turn_end",
 })
 
 
@@ -143,6 +155,125 @@ def append_transcript_object(session_key: str, obj: dict[str, Any]) -> None:
         os.fsync(f.fileno())
 
 
+def normalize_webui_turn_id(value: Any) -> str:
+    if isinstance(value, str):
+        candidate = value.strip()
+        if _WEBUI_TURN_ID_RE.fullmatch(candidate):
+            return candidate
+    return str(uuid.uuid4())
+
+
+def webui_message_source(metadata: dict[str, Any] | None) -> dict[str, str] | None:
+    raw = (metadata or {}).get(WEBUI_MESSAGE_SOURCE_METADATA_KEY)
+    if not isinstance(raw, dict) or raw.get("kind") != "cron":
+        return None
+    source: dict[str, str] = {"kind": "cron"}
+    label = raw.get("label")
+    if isinstance(label, str) and label.strip():
+        source["label"] = label.strip()
+    return source
+
+
+class WebUITranscriptRecorder:
+    """Prepare and persist WebUI wire events without leaking UI rules into channels."""
+
+    def __init__(self, log: Any = logger) -> None:
+        self._log = log
+        self._turn_sequences: dict[tuple[str, str], int] = {}
+
+    def client_turn_metadata(self, value: Any) -> dict[str, str]:
+        return {WEBUI_TURN_METADATA_KEY: normalize_webui_turn_id(value)}
+
+    def prepare_event(
+        self,
+        chat_id: str,
+        event: dict[str, Any],
+        *,
+        metadata: dict[str, Any] | None = None,
+        phase: str | None = None,
+        include_source: bool = False,
+    ) -> None:
+        if include_source and (source := webui_message_source(metadata)):
+            event["source"] = source
+        self._annotate_turn(chat_id, event, metadata, phase)
+
+    def prepare_and_append(
+        self,
+        chat_id: str,
+        event: dict[str, Any],
+        *,
+        metadata: dict[str, Any] | None = None,
+        phase: str | None = None,
+        include_source: bool = False,
+        transcript_overrides: dict[str, Any] | None = None,
+    ) -> None:
+        self.prepare_event(
+            chat_id,
+            event,
+            metadata=metadata,
+            phase=phase,
+            include_source=include_source,
+        )
+        record = dict(event)
+        if transcript_overrides:
+            record.update(transcript_overrides)
+        self.append(chat_id, record)
+
+    def append_user_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        metadata: dict[str, Any],
+        media_paths: list[str] | None = None,
+        cli_apps: list[dict[str, Any]] | None = None,
+        mcp_presets: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if text.strip() == "/stop" and not media_paths:
+            return
+        payload = build_user_transcript_event(
+            chat_id,
+            text,
+            media_paths=media_paths,
+            cli_apps=cli_apps,
+            mcp_presets=mcp_presets,
+        )
+        if payload is None:
+            return
+        self.prepare_and_append(chat_id, payload, metadata=metadata, phase="user")
+
+    def append(self, chat_id: str, event: dict[str, Any]) -> None:
+        try:
+            dup = json.loads(json.dumps(event, ensure_ascii=False))
+            append_transcript_object(f"websocket:{chat_id}", dup)
+        except (OSError, ValueError, TypeError) as e:
+            self._log.warning("webui transcript append failed: {}", e)
+
+    def _next_turn_seq(self, chat_id: str, turn_id: str) -> int:
+        key = (chat_id, turn_id)
+        seq = self._turn_sequences.get(key, 0) + 1
+        self._turn_sequences[key] = seq
+        return seq
+
+    def _annotate_turn(
+        self,
+        chat_id: str,
+        event: dict[str, Any],
+        metadata: dict[str, Any] | None,
+        phase: str | None,
+    ) -> None:
+        if phase is None:
+            return
+        turn_id = (metadata or {}).get(WEBUI_TURN_METADATA_KEY)
+        if not isinstance(turn_id, str) or not turn_id:
+            return
+        event["turn_id"] = turn_id
+        event["turn_phase"] = phase
+        event["turn_seq"] = self._next_turn_seq(chat_id, turn_id)
+        if phase == "complete":
+            self._turn_sequences.pop((chat_id, turn_id), None)
+
+
 def delete_webui_transcript(session_key: str) -> bool:
     path = webui_transcript_path(session_key)
     if not path.is_file():
@@ -153,6 +284,165 @@ def delete_webui_transcript(session_key: str) -> bool:
     except OSError as e:
         logger.warning("Failed to delete webui transcript {}: {}", path, e)
         return False
+
+
+def build_user_transcript_event(
+    chat_id: str,
+    text: str,
+    *,
+    media_paths: list[Any] | None = None,
+    cli_apps: list[Any] | None = None,
+    mcp_presets: list[Any] | None = None,
+) -> dict[str, Any] | None:
+    paths = [str(path) for path in (media_paths or []) if path]
+    if not text and not paths:
+        return None
+    event: dict[str, Any] = {
+        "event": "user",
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if paths:
+        event["media_paths"] = paths
+    apps = [dict(app) for app in (cli_apps or []) if isinstance(app, Mapping)]
+    if apps:
+        event["cli_apps"] = apps
+    presets = [dict(preset) for preset in (mcp_presets or []) if isinstance(preset, Mapping)]
+    if presets:
+        event["mcp_presets"] = presets
+    return event
+
+
+def _session_user_event(
+    session_key: str,
+    message: dict[str, Any],
+) -> dict[str, Any] | None:
+    if message.get("role") != "user":
+        return None
+    content = message.get("content")
+    text = content if isinstance(content, str) else ""
+    media = message.get("media")
+    cli_apps = message.get("cli_apps")
+    mcp_presets = message.get("mcp_presets")
+    chat_id = session_key.split(":", 1)[1] if ":" in session_key else session_key
+    return build_user_transcript_event(
+        chat_id,
+        text,
+        media_paths=media if isinstance(media, list) else None,
+        cli_apps=cli_apps if isinstance(cli_apps, list) else None,
+        mcp_presets=mcp_presets if isinstance(mcp_presets, list) else None,
+    )
+
+
+def _assistant_text_signature(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _session_backfill_turns(
+    session_key: str,
+    session_messages: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
+    turns: list[tuple[dict[str, Any], tuple[str, ...]]] = []
+    current_user: dict[str, Any] | None = None
+    assistant_texts: list[str] = []
+
+    def flush() -> None:
+        if current_user is None:
+            return
+        signature = tuple(text for text in assistant_texts if text)
+        if signature:
+            turns.append((current_user, signature))
+
+    for message in session_messages:
+        role = message.get("role")
+        if role == "user":
+            flush()
+            current_user = _session_user_event(session_key, message)
+            assistant_texts = []
+            continue
+        if role == "assistant" and current_user is not None:
+            text = _assistant_text_signature(message.get("content"))
+            if text:
+                assistant_texts.append(text)
+    flush()
+    return turns
+
+
+def _split_transcript_turns(lines: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    turns: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for rec in lines:
+        current.append(rec)
+        if rec.get("event") == "turn_end":
+            turns.append(current)
+            current = []
+    if current:
+        turns.append(current)
+    return turns
+
+
+def _transcript_turn_signature(records: list[dict[str, Any]]) -> tuple[str, ...]:
+    texts: list[str] = []
+    for message in replay_transcript_to_ui_messages(records):
+        if message.get("role") != "assistant" or message.get("kind") == "trace":
+            continue
+        text = _assistant_text_signature(message.get("content"))
+        if text:
+            texts.append(text)
+    return tuple(texts)
+
+
+def _find_unique_session_turn(
+    session_turns: list[tuple[dict[str, Any], tuple[str, ...]]],
+    signature: tuple[str, ...],
+    start: int,
+) -> int | None:
+    if not signature:
+        return None
+    found: int | None = None
+    for index in range(start, len(session_turns)):
+        if session_turns[index][1] != signature:
+            continue
+        if found is not None:
+            return None
+        found = index
+    return found
+
+
+def _with_backfilled_user(
+    records: list[dict[str, Any]],
+    user_event: dict[str, Any],
+) -> list[dict[str, Any]]:
+    for index, rec in enumerate(records):
+        if rec.get("event") in _TURN_DISPLAY_EVENTS:
+            return [*records[:index], dict(user_event), *records[index:]]
+    return records
+
+
+def inject_missing_user_events_from_session(
+    session_key: str,
+    lines: list[dict[str, Any]],
+    session_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Backfill user rows for legacy WebUI transcripts that only stored assistant streams."""
+    if not lines or not session_messages:
+        return lines
+    session_turns = _session_backfill_turns(session_key, session_messages)
+    if not session_turns:
+        return lines
+
+    out: list[dict[str, Any]] = []
+    session_cursor = 0
+    for turn in _split_transcript_turns(lines):
+        has_user = any(rec.get("event") == "user" for rec in turn)
+        signature = _transcript_turn_signature(turn)
+        match_index = _find_unique_session_turn(session_turns, signature, session_cursor)
+        if match_index is None:
+            out.extend(turn)
+            continue
+        out.extend(turn if has_user else _with_backfilled_user(turn, session_turns[match_index][0]))
+        session_cursor = match_index + 1
+    return out
 
 
 def _format_tool_call_trace(call: Any) -> str | None:
@@ -353,17 +643,36 @@ def _merge_unique_tool_trace_lines(
     return traces, added
 
 
+def _media_from_signed_urls(value: Any) -> list[dict[str, Any]]:
+    media: list[dict[str, Any]] = []
+    urls = value if isinstance(value, list) else []
+    for m in urls:
+        if isinstance(m, dict) and m.get("url"):
+            name = str(m.get("name") or "")
+            media.append(
+                {
+                    "kind": _media_kind_from_name(name),
+                    "url": str(m["url"]),
+                    "name": name,
+                },
+            )
+    return media
+
+
 def replay_transcript_to_ui_messages(
     lines: list[dict[str, Any]],
     *,
     augment_user_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
+    augment_assistant_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
     augment_assistant_text: Callable[[str], str] | None = None,
 ) -> list[dict[str, Any]]:
     """Fold JSONL records into ``UIMessage``-shaped dicts for the WebUI.
 
     Mirrors the core fold in ``useNanobotStream.ts`` (delta, reasoning,
     message+kind, turn_end). ``augment_user_media`` maps persisted filesystem
-    paths to ``{url, name?}`` / attachment dicts the client expects.
+    paths to ``{url, name?}`` / attachment dicts the client expects. Assistant
+    media gets a separate hook so replay can re-sign outbound attachments after
+    a gateway restart instead of reusing stale process-local signed URLs.
     """
     messages: list[dict[str, Any]] = []
     buffer_message_id: str | None = None
@@ -373,6 +682,8 @@ def replay_transcript_to_ui_messages(
     active_file_edit_segment_id: str | None = None
     activity_segment_counter = 0
     _ts_base = int(time.time() * 1000)
+    closed_turn_ids: set[str] = set()
+    replay_turn_aliases: dict[str, str] = {}
 
     def _new_id(prefix: str, idx: int) -> str:
         return f"{prefix}-{idx}-{uuid.uuid4().hex[:8]}"
@@ -384,6 +695,42 @@ def replay_transcript_to_ui_messages(
         if activate:
             active_activity_segment_id = segment_id
         return segment_id
+
+    def _turn_fields(rec: dict[str, Any], fallback_phase: str | None = None) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        turn_id = rec.get("turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            if turn_id in closed_turn_ids:
+                fields["turnId"] = replay_turn_aliases.setdefault(
+                    turn_id,
+                    f"{turn_id}:replay:{idx}",
+                )
+            else:
+                fields["turnId"] = turn_id
+        phase = rec.get("turn_phase")
+        if isinstance(phase, str) and phase:
+            fields["turnPhase"] = phase
+        elif fallback_phase:
+            fields["turnPhase"] = fallback_phase
+        seq = rec.get("turn_seq")
+        if isinstance(seq, (int, float)):
+            fields["turnSeq"] = int(seq)
+        return fields
+
+    def _source_fields(rec: dict[str, Any]) -> dict[str, Any]:
+        source = rec.get("source")
+        if not isinstance(source, dict) or source.get("kind") != "cron":
+            return {}
+        out: dict[str, Any] = {"source": {"kind": "cron"}}
+        label = source.get("label")
+        if isinstance(label, str) and label.strip():
+            out["source"]["label"] = label.strip()
+        return out
+
+    def _same_turn(message: dict[str, Any], turn_fields: dict[str, Any]) -> bool:
+        turn_id = turn_fields.get("turnId")
+        message_turn_id = message.get("turnId")
+        return not turn_id or not message_turn_id or turn_id == message_turn_id
 
     def _ensure_activity_segment() -> str:
         return active_activity_segment_id or _new_activity_segment()
@@ -399,7 +746,13 @@ def replay_transcript_to_ui_messages(
             active_activity_segment_id = None
             active_file_edit_segment_id = None
 
-    def attach_reasoning_chunk(prev: list[dict[str, Any]], chunk: str, idx: int) -> None:
+    def attach_reasoning_chunk(
+        prev: list[dict[str, Any]],
+        chunk: str,
+        idx: int,
+        turn_fields: dict[str, Any] | None = None,
+    ) -> None:
+        turn_fields = turn_fields or {}
         for i in range(len(prev) - 1, -1, -1):
             candidate = prev[i]
             if candidate.get("role") == "user":
@@ -408,6 +761,8 @@ def replay_transcript_to_ui_messages(
                 break
             if candidate.get("role") != "assistant":
                 continue
+            if not _same_turn(candidate, turn_fields):
+                break
             content = str(candidate.get("content") or "")
             has_answer = len(content) > 0
             if (
@@ -421,6 +776,7 @@ def replay_transcript_to_ui_messages(
                     "reasoning": (str(candidate.get("reasoning") or "")) + chunk,
                     "reasoningStreaming": True,
                     "activitySegmentId": candidate.get("activitySegmentId") or _ensure_activity_segment(),
+                    **turn_fields,
                 }
                 return
             if not has_answer and candidate.get("isStreaming"):
@@ -429,6 +785,7 @@ def replay_transcript_to_ui_messages(
                     "reasoning": chunk,
                     "reasoningStreaming": True,
                     "activitySegmentId": candidate.get("activitySegmentId") or _ensure_activity_segment(),
+                    **turn_fields,
                 }
                 return
             break
@@ -442,11 +799,16 @@ def replay_transcript_to_ui_messages(
                 "reasoning": chunk,
                 "reasoningStreaming": True,
                 "activitySegmentId": segment,
+                **turn_fields,
                 "createdAt": _ts_base + idx,
             },
         )
 
-    def find_active_placeholder(prev: list[dict[str, Any]]) -> str | None:
+    def find_active_placeholder(
+        prev: list[dict[str, Any]],
+        turn_fields: dict[str, Any] | None = None,
+    ) -> str | None:
+        turn_fields = turn_fields or {}
         last = prev[-1] if prev else None
         if not last:
             return None
@@ -455,6 +817,8 @@ def replay_transcript_to_ui_messages(
         if str(last.get("content") or ""):
             return None
         if not last.get("isStreaming"):
+            return None
+        if not _same_turn(last, turn_fields):
             return None
         return str(last.get("id"))
 
@@ -534,7 +898,7 @@ def replay_transcript_to_ui_messages(
     def absorb_complete(extra: dict[str, Any], idx: int) -> None:
         nonlocal active_activity_segment_id, active_file_edit_segment_id
         last = messages[-1] if messages else None
-        if last and is_reasoning_only_placeholder(last):
+        if last and is_reasoning_only_placeholder(last) and _same_turn(last, extra):
             messages[-1] = {
                 **last,
                 **extra,
@@ -581,8 +945,13 @@ def replay_transcript_to_ui_messages(
                         return i
         return None
 
-    def upsert_file_edits(edits: list[dict[str, Any]], idx: int) -> None:
+    def upsert_file_edits(
+        edits: list[dict[str, Any]],
+        idx: int,
+        turn_fields: dict[str, Any] | None = None,
+    ) -> None:
         nonlocal active_file_edit_segment_id
+        turn_fields = turn_fields or {}
         if not edits:
             return
         segment = active_file_edit_segment_id
@@ -609,6 +978,7 @@ def replay_transcript_to_ui_messages(
                     "traces": [],
                     "fileEdits": [],
                     "activitySegmentId": segment,
+                    **turn_fields,
                     "createdAt": _ts_base + idx,
                 },
             )
@@ -640,6 +1010,7 @@ def replay_transcript_to_ui_messages(
             **last,
             "fileEdits": existing,
             "activitySegmentId": last.get("activitySegmentId") or segment,
+            **turn_fields,
         }
 
     for idx, rec in enumerate(lines):
@@ -660,6 +1031,7 @@ def replay_transcript_to_ui_messages(
                 "id": _new_id("u", idx),
                 "role": "user",
                 "content": text_s,
+                **_turn_fields(rec, "user"),
                 "createdAt": _ts_base + idx,
             }
             if media_att:
@@ -680,7 +1052,11 @@ def replay_transcript_to_ui_messages(
         if ev == "file_edit":
             raw_edits = rec.get("edits")
             if isinstance(raw_edits, list):
-                upsert_file_edits([e for e in raw_edits if isinstance(e, dict)], idx)
+                upsert_file_edits(
+                    [e for e in raw_edits if isinstance(e, dict)],
+                    idx,
+                    _turn_fields(rec, "activity"),
+                )
             continue
 
         if ev == "delta":
@@ -690,7 +1066,8 @@ def replay_transcript_to_ui_messages(
             if not isinstance(chunk, str):
                 continue
             close_activity_for_answer()
-            adopted = find_active_placeholder(messages) if buffer_message_id is None else None
+            turn_fields = _turn_fields(rec, "answer")
+            adopted = find_active_placeholder(messages, turn_fields) if buffer_message_id is None else None
             if buffer_message_id is None:
                 if adopted:
                     buffer_message_id = adopted
@@ -702,6 +1079,7 @@ def replay_transcript_to_ui_messages(
                             "role": "assistant",
                             "content": "",
                             "isStreaming": True,
+                            **_turn_fields(rec, "answer"),
                             "createdAt": _ts_base + idx,
                         },
                     )
@@ -709,7 +1087,12 @@ def replay_transcript_to_ui_messages(
             combined = "".join(buffer_parts)
             for i, m in enumerate(messages):
                 if m.get("id") == buffer_message_id:
-                    messages[i] = {**m, "content": combined, "isStreaming": True}
+                    messages[i] = {
+                        **m,
+                        "content": combined,
+                        "isStreaming": True,
+                        **_turn_fields(rec, "answer"),
+                    }
                     break
             continue
 
@@ -728,13 +1111,19 @@ def replay_transcript_to_ui_messages(
                             "role": "assistant",
                             "content": final_text,
                             "isStreaming": True,
+                            **_turn_fields(rec, "answer"),
                             "createdAt": _ts_base + idx,
                         },
                     )
                 else:
                     for i, m in enumerate(messages):
                         if m.get("id") == buffer_message_id:
-                            messages[i] = {**m, "content": final_text, "isStreaming": True}
+                            messages[i] = {
+                                **m,
+                                "content": final_text,
+                                "isStreaming": True,
+                                **_turn_fields(rec, "answer"),
+                            }
                             break
             buffer_message_id = None
             buffer_parts = []
@@ -747,7 +1136,7 @@ def replay_transcript_to_ui_messages(
             if not isinstance(chunk, str) or not chunk:
                 continue
             close_file_edit_phase_before_activity()
-            attach_reasoning_chunk(messages, chunk, idx)
+            attach_reasoning_chunk(messages, chunk, idx, _turn_fields(rec, "reasoning"))
             continue
 
         if ev == "reasoning_end":
@@ -769,7 +1158,7 @@ def replay_transcript_to_ui_messages(
                 if not isinstance(line, str) or not line:
                     continue
                 close_file_edit_phase_before_activity()
-                attach_reasoning_chunk(messages, line, idx)
+                attach_reasoning_chunk(messages, line, idx, _turn_fields(rec, "reasoning"))
                 close_reasoning(messages)
                 continue
             if kind in ("tool_hint", "progress"):
@@ -811,6 +1200,7 @@ def replay_transcript_to_ui_messages(
                         if visible_structured_events
                         else last.get("toolEvents"),
                         "activitySegmentId": last.get("activitySegmentId") or segment,
+                        **_turn_fields(rec, "activity"),
                     }
                     messages[-1] = merged
                 else:
@@ -823,6 +1213,7 @@ def replay_transcript_to_ui_messages(
                             "traces": trace_lines,
                             **({"toolEvents": visible_structured_events} if visible_structured_events else {}),
                             "activitySegmentId": segment,
+                            **_turn_fields(rec, "activity"),
                             "createdAt": _ts_base + idx,
                         },
                     )
@@ -832,25 +1223,22 @@ def replay_transcript_to_ui_messages(
             buffer_parts = []
             text = rec.get("text")
             content_s = text if isinstance(text, str) else ""
-            media_urls = rec.get("media_urls")
             media: list[dict[str, Any]] = []
-            if isinstance(media_urls, list):
-                for m in media_urls:
-                    if isinstance(m, dict) and m.get("url"):
-                        name = str(m.get("name") or "")
-                        media.append(
-                            {
-                                "kind": _media_kind_from_name(name),
-                                "url": str(m["url"]),
-                                "name": name,
-                            },
-                        )
+            raw_media = rec.get("media")
+            raw_media_list = raw_media if isinstance(raw_media, list) else []
+            media_paths = [path for path in raw_media_list if isinstance(path, str) and path]
+            if media_paths and augment_assistant_media is not None:
+                media = augment_assistant_media(media_paths)
+            if not media and (not media_paths or augment_assistant_media is None):
+                media = _media_from_signed_urls(rec.get("media_urls"))
             extra: dict[str, Any] = {"content": content_s}
             if media:
                 extra["media"] = media
             lat = rec.get("latency_ms")
             if isinstance(lat, (int, float)) and lat >= 0:
                 extra["latencyMs"] = int(lat)
+            extra.update(_turn_fields(rec, "answer"))
+            extra.update(_source_fields(rec))
             absorb_complete(extra, idx)
             if media:
                 suppress_until_turn_end = True
@@ -860,6 +1248,12 @@ def replay_transcript_to_ui_messages(
             suppress_until_turn_end = False
             active_activity_segment_id = None
             active_file_edit_segment_id = None
+            turn_id = rec.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                if turn_id in replay_turn_aliases:
+                    replay_turn_aliases.pop(turn_id, None)
+                else:
+                    closed_turn_ids.add(turn_id)
             for i, m in enumerate(messages):
                 if m.get("isStreaming"):
                     messages[i] = {**m, "isStreaming": False}
@@ -888,15 +1282,19 @@ def build_webui_thread_response(
     session_key: str,
     *,
     augment_user_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
+    augment_assistant_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
     augment_assistant_text: Callable[[str], str] | None = None,
+    session_messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Return a payload compatible with ``WebuiThreadPersistedPayload``."""
     lines = read_transcript_lines(session_key)
     if not lines:
         return None
+    lines = inject_missing_user_events_from_session(session_key, lines, session_messages)
     msgs = replay_transcript_to_ui_messages(
         lines,
         augment_user_media=augment_user_media,
+        augment_assistant_media=augment_assistant_media,
         augment_assistant_text=augment_assistant_text,
     )
     return {

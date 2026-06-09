@@ -101,6 +101,22 @@ describe("MessageBubble", () => {
     expect(screen.getByText(/not @krita/)).toBeInTheDocument();
   });
 
+  it("renders a lightweight automation source label for cron replies", () => {
+    const message: UIMessage = {
+      id: "a-cron",
+      role: "assistant",
+      content: "Time to drink water.",
+      source: { kind: "cron", label: "drink water" },
+      createdAt: Date.now(),
+    };
+
+    render(<MessageBubble message={message} />);
+
+    expect(screen.getByText("drink water")).toBeInTheDocument();
+    expect(screen.getByText("Triggered automatically")).toBeInTheDocument();
+    expect(screen.getByText("Time to drink water.")).toBeInTheDocument();
+  });
+
   it("renders structured CLI app attachments even without the installed catalog", () => {
     const message: UIMessage = {
       id: "u-cli-attached",
@@ -165,6 +181,72 @@ describe("MessageBubble", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Copied reply" })).toBeInTheDocument(),
     );
+  });
+
+  it("copies completed assistant replies with the textarea fallback", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    const message: UIMessage = {
+      id: "a-copy-fallback",
+      role: "assistant",
+      content: "Fallback copy reply.",
+      createdAt: Date.now(),
+    };
+
+    try {
+      render(<MessageBubble message={message} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Copy reply" }));
+
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Copied reply" })).toBeInTheDocument(),
+      );
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+      Reflect.deleteProperty(document, "execCommand");
+    }
+  });
+
+  it("falls back when the Clipboard API rejects assistant reply copy", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("not allowed"));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    const message: UIMessage = {
+      id: "a-copy-reject",
+      role: "assistant",
+      content: "Rejected clipboard copy.",
+      createdAt: Date.now(),
+    };
+
+    try {
+      render(<MessageBubble message={message} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Copy reply" }));
+
+      expect(writeText).toHaveBeenCalledWith("Rejected clipboard copy.");
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Copied reply" })).toBeInTheDocument(),
+      );
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+      Reflect.deleteProperty(document, "execCommand");
+    }
   });
 
   it("does not show copy actions for streaming placeholders", () => {

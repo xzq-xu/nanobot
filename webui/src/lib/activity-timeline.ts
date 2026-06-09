@@ -38,6 +38,10 @@ export type TurnUnit =
   | { type: "activity"; messages: UIMessage[]; items: ActivityItem[]; turnLatencyMs?: number }
   | { type: "message"; message: UIMessage };
 
+interface NormalizeActivityTimelineOptions {
+  preserveTrailingActivity?: boolean;
+}
+
 export function isReasoningOnlyAssistant(message: UIMessage): boolean {
   if (message.role !== "assistant" || message.kind === "trace") return false;
   if (message.content.trim().length > 0) return false;
@@ -48,17 +52,30 @@ export function isAgentActivityMember(message: UIMessage): boolean {
   return isReasoningOnlyAssistant(message) || message.kind === "trace";
 }
 
-export function normalizeActivityTimeline(messages: UIMessage[]): TurnUnit[] {
+export function normalizeActivityTimeline(
+  messages: UIMessage[],
+  options: NormalizeActivityTimelineOptions = {},
+): TurnUnit[] {
   const units: TurnUnit[] = [];
   let turnMessages: UIMessage[] = [];
+  let activeTurnId: string | undefined;
 
-  const flushTurn = () => {
+  const flushTurn = (flushOptions: NormalizeActivityTimelineOptions = {}) => {
     if (turnMessages.length === 0) return;
 
-    const activityMessages: UIMessage[] = [];
-    const visibleMessages: UIMessage[] = [];
+    const turnUnits: TurnUnit[] = [];
+    const orderedTurnMessages = orderMessagesByTurnSeq(turnMessages);
+    const visibleMessages = visibleMessagesForTurn(orderedTurnMessages);
+    let visibleIndex = 0;
+    let activityMessages: UIMessage[] = [];
 
-    for (const message of turnMessages) {
+    const flushActivityMessages = () => {
+      if (!activityMessages.length) return;
+      pushActivityUnits(turnUnits, activityMessages, visibleMessages.slice(visibleIndex));
+      activityMessages = [];
+    };
+
+    for (const message of orderedTurnMessages) {
       if (isAgentActivityMember(message)) {
         activityMessages.push(message);
         continue;
@@ -66,39 +83,101 @@ export function normalizeActivityTimeline(messages: UIMessage[]): TurnUnit[] {
 
       if (assistantHasInlineReasoning(message)) {
         activityMessages.push(reasoningOnlyMessageFromAnswer(message));
-        visibleMessages.push(stripInlineReasoning(message));
+        flushActivityMessages();
+        turnUnits.push({ type: "message", message: stripInlineReasoning(message) });
+        visibleIndex += 1;
         continue;
       }
 
-      visibleMessages.push(message);
+      flushActivityMessages();
+      turnUnits.push({ type: "message", message });
+      visibleIndex += 1;
     }
 
-    pushActivityUnits(units, activityMessages, visibleMessages);
-
-    for (const message of visibleMessages) {
-      units.push({ type: "message", message });
-    }
-
+    flushActivityMessages();
+    units.push(...normalizeCompletedTurnUnits(turnUnits, flushOptions));
     turnMessages = [];
+    activeTurnId = undefined;
   };
 
   for (const message of messages) {
     if (message.role === "user") {
       flushTurn();
       units.push({ type: "message", message });
+      activeTurnId = message.turnId;
       continue;
     }
 
+    if (message.turnId && activeTurnId && message.turnId !== activeTurnId) {
+      flushTurn();
+    }
+    if (message.turnId) {
+      activeTurnId = message.turnId;
+    }
     turnMessages.push(message);
   }
 
-  flushTurn();
+  flushTurn(options);
   return units;
+}
+
+function orderMessagesByTurnSeq(messages: UIMessage[]): UIMessage[] {
+  if (
+    messages.length < 2
+    || !messages.every((message) => Number.isFinite(message.turnSeq))
+  ) {
+    return messages;
+  }
+  return messages
+    .map((message, index) => ({ message, index }))
+    .sort((left, right) => {
+      const bySeq = (left.message.turnSeq ?? 0) - (right.message.turnSeq ?? 0);
+      return bySeq || left.index - right.index;
+    })
+    .map(({ message }) => message);
+}
+
+function normalizeCompletedTurnUnits(
+  turnUnits: TurnUnit[],
+  options: NormalizeActivityTimelineOptions,
+): TurnUnit[] {
+  if (options.preserveTrailingActivity || turnUnits.length < 2) return turnUnits;
+  if (turnUnits[turnUnits.length - 1]?.type !== "activity") return turnUnits;
+
+  let trailingStart = turnUnits.length - 1;
+  while (trailingStart > 0 && turnUnits[trailingStart - 1]?.type === "activity") {
+    trailingStart -= 1;
+  }
+
+  const previous = turnUnits[trailingStart - 1];
+  if (
+    !previous
+    || previous.type !== "message"
+    || previous.message.role !== "assistant"
+  ) {
+    return turnUnits;
+  }
+
+  return [
+    ...turnUnits.slice(0, trailingStart - 1),
+    ...turnUnits.slice(trailingStart),
+    previous,
+  ];
+}
+
+function visibleMessagesForTurn(messages: UIMessage[]): UIMessage[] {
+  const visibleMessages: UIMessage[] = [];
+  for (const message of messages) {
+    if (isAgentActivityMember(message)) continue;
+    visibleMessages.push(assistantHasInlineReasoning(message) ? stripInlineReasoning(message) : message);
+  }
+  return visibleMessages;
 }
 
 function pushActivityUnits(units: TurnUnit[], activityMessages: UIMessage[], visibleMessages: UIMessage[]) {
   let runMessages: UIMessage[] = [];
   let runBucket: "file" | "other" | undefined;
+  let runSegmentId: string | undefined;
 
   const flushRun = () => {
     if (!runMessages.length) return;
@@ -110,14 +189,23 @@ function pushActivityUnits(units: TurnUnit[], activityMessages: UIMessage[], vis
     });
     runMessages = [];
     runBucket = undefined;
+    runSegmentId = undefined;
   };
 
   for (const message of activityMessages) {
     const bucket = isFileEditActivityMessage(message) ? "file" : "other";
-    if (runBucket && bucket !== runBucket) {
+    const segmentId = message.activitySegmentId;
+    const segmentChanged =
+      bucket === "file"
+      && runBucket === "file"
+      && !!runSegmentId
+      && !!segmentId
+      && runSegmentId !== segmentId;
+    if ((runBucket && bucket !== runBucket) || segmentChanged) {
       flushRun();
     }
     runBucket = bucket;
+    if (segmentId) runSegmentId = segmentId;
     runMessages.push(message);
   }
 
